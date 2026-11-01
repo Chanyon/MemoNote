@@ -1,6 +1,6 @@
 # 白板笔记（Whiteboard Notes）
 
-一款使用 Rust 与 [GPUI Kit](https://crates.io/crates/gpui-kit) 构建的本地无限画布笔记应用。笔记直接保存为 Markdown 或纯文本文件，白板布局保存在同名的 `.board.json` 中，适合整理灵感、阅读笔记和思维导图。
+一款AI开发，使用 Rust 与 [GPUI Kit](https://crates.io/crates/gpui-kit) 构建的本地无限画布笔记应用。笔记直接保存为 Markdown 或纯文本文件，白板布局保存在同名的 `.board.json` 中，适合整理灵感、阅读笔记和思维导图。
 
 ## 功能
 

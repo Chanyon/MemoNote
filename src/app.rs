@@ -134,6 +134,14 @@ struct GroupDrag {
     nodes: Vec<(Uuid, f32, f32)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EditorResize {
+    start_x: f32,
+    start_y: f32,
+    start_width: f32,
+    start_height: f32,
+}
+
 pub struct WhiteboardApp {
     root: PathBuf,
     entries: Vec<TreeEntry>,
@@ -166,6 +174,9 @@ pub struct WhiteboardApp {
     rename_dialog: Option<RenameDialog>,
     delete_dialog: Option<DeleteDialog>,
     editor: Option<EditorModal>,
+    editor_width: f32,
+    editor_height: f32,
+    editor_resize: Option<EditorResize>,
     status: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -265,6 +276,9 @@ impl WhiteboardApp {
             rename_dialog: None,
             delete_dialog: None,
             editor: None,
+            editor_width: 760.0,
+            editor_height: 600.0,
+            editor_resize: None,
             status,
             _subscriptions: Vec::new(),
         };
@@ -1102,6 +1116,7 @@ impl WhiteboardApp {
         let Some(note) = &self.note else {
             return;
         };
+        self.editor_resize = None;
         let Some(node) = note.board.node(id) else {
             return;
         };
@@ -1173,6 +1188,7 @@ impl WhiteboardApp {
         let Some(editor) = self.editor.take() else {
             return;
         };
+        self.editor_resize = None;
         let zh = self.is_zh();
 
         match editor.target {
@@ -1257,6 +1273,7 @@ impl WhiteboardApp {
 
     fn cancel_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor = None;
+        self.editor_resize = None;
         self.board_focus.focus(window, cx);
         cx.notify();
     }
@@ -2215,6 +2232,56 @@ impl WhiteboardApp {
                 ))
         {
             self.save_editor(window, cx);
+        }
+    }
+
+    fn start_editor_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_resize = Some(EditorResize {
+            start_x: f32::from(event.position.x),
+            start_y: f32::from(event.position.y),
+            start_width: self.editor_width,
+            start_height: self.editor_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn editor_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.editor_resize else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let max_width = (f32::from(viewport.width) - 40.0).max(480.0);
+        let max_height = (f32::from(viewport.height) - 40.0).max(320.0);
+        let width = (resize.start_width + (f32::from(event.position.x) - resize.start_x) * 2.0)
+            .clamp(480.0, max_width);
+        let height = (resize.start_height + (f32::from(event.position.y) - resize.start_y) * 2.0)
+            .clamp(320.0, max_height);
+        if (self.editor_width - width).abs() > 0.01 || (self.editor_height - height).abs() > 0.01 {
+            self.editor_width = width;
+            self.editor_height = height;
+            cx.notify();
+        }
+    }
+
+    fn finish_editor_resize(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_resize.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -3968,7 +4035,7 @@ impl WhiteboardApp {
             .into_any_element()
     }
 
-    fn render_editor_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_editor_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(editor) = self.editor else {
             return div().into_any_element();
         };
@@ -4007,6 +4074,14 @@ impl WhiteboardApp {
         };
 
         let show_format = matches!(editor.target, EditTarget::Text(_));
+        let viewport = window.viewport_size();
+        let max_width = (f32::from(viewport.width) - 40.0).max(480.0);
+        let max_height = (f32::from(viewport.height) - 40.0).max(320.0);
+        if is_body {
+            self.editor_width = self.editor_width.clamp(480.0, max_width);
+            self.editor_height = self.editor_height.clamp(320.0, max_height);
+        }
+        let dialog_width = if is_body { self.editor_width } else { 760.0 };
 
         div()
             .absolute()
@@ -4016,12 +4091,16 @@ impl WhiteboardApp {
             .justify_center()
             .bg(overlay)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_move(cx.listener(Self::editor_resize_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_editor_resize))
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_key_down(cx.listener(Self::editor_key_down))
             .child(
                 v_flex()
-                    .w(px(760.))
+                    .relative()
+                    .w(px(dialog_width))
                     .max_w(relative(0.92))
+                    .when(is_body, |this| this.h(px(self.editor_height)))
                     .gap_3()
                     .rounded(px(14.))
                     .border_1()
@@ -4075,7 +4154,8 @@ impl WhiteboardApp {
                     .child(if is_body {
                         Textarea::new(&self.body_input)
                             .w_full()
-                            .h(px(430.))
+                            .flex_1()
+                            .min_h_0()
                             .into_any_element()
                     } else {
                         Input::new(&self.title_input).w_full().into_any_element()
@@ -4100,7 +4180,32 @@ impl WhiteboardApp {
                                         this.save_editor(window, cx);
                                     })),
                             ),
-                    ),
+                    )
+                    .when(is_body, |this| {
+                        this.child(
+                            div()
+                                .id("editor-resize")
+                                .absolute()
+                                .right(px(4.))
+                                .bottom(px(4.))
+                                .flex()
+                                .size(px(24.))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.))
+                                .cursor_nwse_resize()
+                                .hover(|style| style.bg(muted.opacity(0.15)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::start_editor_resize),
+                                )
+                                .child(
+                                    Icon::new(IconName::ResizeCorner)
+                                        .size(px(16.))
+                                        .text_color(muted),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
