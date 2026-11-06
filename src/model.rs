@@ -108,6 +108,10 @@ impl NodeKind {
         matches!(self, Self::Note { .. })
     }
 
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text { .. })
+    }
+
     pub fn is_mind(&self) -> bool {
         matches!(self, Self::Mind { .. })
     }
@@ -122,6 +126,10 @@ pub struct BoardNode {
     pub h: f32,
     #[serde(default)]
     pub rotation: f32,
+    #[serde(default)]
+    pub auto_height: bool,
+    #[serde(default)]
+    pub locked: bool,
     #[serde(flatten)]
     pub kind: NodeKind,
 }
@@ -135,6 +143,8 @@ impl BoardNode {
             w: 340.0,
             h: 210.0,
             rotation: 0.0,
+            auto_height: false,
+            locked: false,
             kind: NodeKind::Text {
                 content: content.into(),
                 format,
@@ -150,6 +160,8 @@ impl BoardNode {
             w: 480.0,
             h: 350.0,
             rotation: 0.0,
+            auto_height: false,
+            locked: false,
             kind: NodeKind::Note {
                 content: content.into(),
                 format,
@@ -165,6 +177,8 @@ impl BoardNode {
             w: 220.0,
             h: 58.0,
             rotation: 0.0,
+            auto_height: false,
+            locked: false,
             kind: NodeKind::Mind {
                 title: title.into(),
                 parent,
@@ -182,6 +196,8 @@ impl BoardNode {
             w: width,
             h: height,
             rotation: 0.0,
+            auto_height: false,
+            locked: false,
             kind: NodeKind::Image {
                 path: path.into(),
                 width,
@@ -269,12 +285,58 @@ pub fn fit_mind_node(node: &mut BoardNode) {
     }
 }
 
+pub fn repair_corrupted_mind_titles(nodes: &mut [BoardNode]) -> bool {
+    let mut changed = false;
+    for node in nodes.iter_mut() {
+        let corrupted = matches!(
+            &node.kind,
+            NodeKind::Mind { title, .. }
+                if !title.is_empty() && title.chars().all(|ch| ch == '\u{fffd}')
+        );
+        if !corrupted {
+            continue;
+        }
+        if let NodeKind::Mind { title, parent } = &mut node.kind {
+            *title = if parent.is_none() {
+                "中心主题"
+            } else {
+                "子主题"
+            }
+            .to_string();
+        }
+        fit_mind_node(node);
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeConnection {
+    pub id: Uuid,
+    pub from: Uuid,
+    pub to: Uuid,
+}
+
+impl NodeConnection {
+    pub fn new(from: Uuid, to: Uuid) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            from,
+            to,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Board {
     #[serde(default)]
     pub camera: Camera,
     #[serde(default)]
     pub nodes: Vec<BoardNode>,
+    #[serde(default)]
+    pub connections: Vec<NodeConnection>,
+    #[serde(default)]
+    pub note_card_deleted: bool,
 }
 
 impl Board {
@@ -283,6 +345,8 @@ impl Board {
         Self {
             camera: Camera::default(),
             nodes: vec![BoardNode::note(96.0, 96.0, content, format)],
+            connections: Vec::new(),
+            note_card_deleted: false,
         }
     }
 
@@ -305,6 +369,10 @@ impl Board {
                 format,
             };
             return node.id;
+        }
+
+        if self.note_card_deleted {
+            return Uuid::nil();
         }
 
         let node = BoardNode::note(96.0, 96.0, content, format);
@@ -341,6 +409,8 @@ impl NoteDoc {
                 return Err(error).with_context(|| format!("读取白板数据失败: {}", path.display()));
             }
         };
+
+        repair_corrupted_mind_titles(&mut board.nodes);
 
         let note_id = board.ensure_note_node(&content, format);
 
@@ -719,6 +789,26 @@ pub fn read_clipboard_image(root: &Path) -> Result<Option<(PathBuf, f32, f32)>> 
     Ok(Some((path, width as f32, height as f32)))
 }
 
+pub fn save_generated_image(root: &Path, bytes: &[u8]) -> Result<(PathBuf, f32, f32)> {
+    use image::GenericImageView as _;
+
+    let image = image::load_from_memory(bytes).context("generated image could not be decoded")?;
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(anyhow!("generated image has invalid dimensions"));
+    }
+
+    let assets = root.join(".assets");
+    fs::create_dir_all(&assets)
+        .with_context(|| format!("failed to create assets folder: {}", assets.display()))?;
+    let path = assets.join(format!("ai-{}.png", Uuid::new_v4()));
+    image
+        .save(&path)
+        .with_context(|| format!("failed to save generated image: {}", path.display()))?;
+
+    Ok((path, width as f32, height as f32))
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     clipboard.get_text().ok().filter(|text| !text.is_empty())
@@ -743,5 +833,78 @@ mod tests {
             None,
         );
         assert!(node.h > 58.0);
+    }
+
+    #[test]
+    fn old_boards_without_connections_still_load() {
+        let board: Board = serde_json::from_str("{}").expect("empty board should deserialize");
+        assert!(board.connections.is_empty());
+    }
+
+    #[test]
+    fn node_connections_round_trip_through_json() {
+        let from = Uuid::new_v4();
+        let to = Uuid::new_v4();
+        let mut board = Board::default();
+        board.connections.push(NodeConnection::new(from, to));
+
+        let source = serde_json::to_string(&board).expect("board should serialize");
+        let restored: Board = serde_json::from_str(&source).expect("board should deserialize");
+        assert_eq!(restored.connections.len(), 1);
+        assert_eq!(restored.connections[0].from, from);
+        assert_eq!(restored.connections[0].to, to);
+    }
+
+    #[test]
+    fn corrupted_mind_titles_are_repaired() {
+        let root = BoardNode::mind(0.0, 0.0, "\u{fffd}\u{fffd}\u{fffd}\u{fffd}", None);
+        let root_id = root.id;
+        let child = BoardNode::mind(300.0, 0.0, "\u{fffd}\u{fffd}\u{fffd}", Some(root_id));
+        let mut nodes = vec![root, child];
+        assert!(repair_corrupted_mind_titles(&mut nodes));
+        let titles = nodes
+            .iter()
+            .map(|node| match &node.kind {
+                NodeKind::Mind { title, .. } => title.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["中心主题", "子主题"]);
+        assert!(!repair_corrupted_mind_titles(&mut nodes));
+    }
+
+    #[test]
+    fn locked_flag_round_trips_through_json() {
+        let mut node = BoardNode::text(0.0, 0.0, "locked", TextFormat::Plain);
+        node.locked = true;
+        let source = serde_json::to_string(&node).expect("node should serialize");
+        let restored: BoardNode = serde_json::from_str(&source).expect("node should deserialize");
+        assert!(restored.locked);
+    }
+
+    #[test]
+    fn deleted_note_card_is_not_recreated_on_load() {
+        let mut board = Board::with_note("content", TextFormat::Markdown);
+        let note_id = board.note_node_mut().expect("note node").id;
+        board.nodes.retain(|node| node.id != note_id);
+        board.note_card_deleted = true;
+
+        let restored_id = board.ensure_note_node("content", TextFormat::Markdown);
+        assert_eq!(restored_id, Uuid::nil());
+        assert!(board.note_node_mut().is_none());
+    }
+
+    #[test]
+    fn legacy_connection_labels_are_ignored() {
+        let source = r#"{
+            "connections": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "from": "22222222-2222-4222-8222-222222222222",
+                "to": "33333333-3333-4333-8333-333333333333",
+                "label": "supports"
+            }]
+        }"#;
+        let board: Board = serde_json::from_str(source).expect("legacy board should deserialize");
+        assert_eq!(board.connections.len(), 1);
     }
 }

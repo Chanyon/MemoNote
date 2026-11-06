@@ -8,8 +8,9 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures::StreamExt as _;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ElementExt as _, StyledExt as _};
+use gpui_kit::base::{Disableable as _, ElementExt as _, StyledExt as _};
 use gpui_kit::component::{
     ActiveTheme, Icon, Selectable as _, Sizable, Theme,
     button::{Button, ButtonVariants as _},
@@ -17,7 +18,7 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     resizable::{h_resizable, resizable_panel},
-    scroll::ScrollableElement as _,
+    scroll::{ScrollableElement as _, Scrollbar},
     text::TextView,
     v_flex,
 };
@@ -25,15 +26,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use uuid::Uuid;
 
+use crate::ai;
 use crate::model::{
-    BoardNode, Camera, MIND_FONT_SIZE, NodeKind, NoteDoc, TextFormat, TreeEntry, board_path,
-    create_folder, create_note, ensure_data_root, estimate_mind_lines, mind_height_for_lines,
-    mind_text_width, note_title, read_clipboard_image, read_clipboard_text, sanitize_name,
-    scan_tree, validate_note,
+    BoardNode, Camera, MIND_FONT_SIZE, NodeConnection, NodeKind, NoteDoc, TextFormat, TreeEntry,
+    board_path, create_folder, create_note, ensure_data_root, estimate_mind_lines,
+    mind_height_for_lines, mind_text_width, note_title, read_clipboard_image, read_clipboard_text,
+    sanitize_name, scan_tree, validate_note,
 };
 use crate::settings::{
-    AppSettings, Language, THEME_PRESETS, ThemePreset, accent_preview, apply_theme, optional_color,
-    path_is_usable, set_notes_root_default,
+    AiSettings, AppSettings, Language, THEME_PRESETS, ThemePreset, accent_preview, apply_theme,
+    optional_color, path_is_usable, set_notes_root_default,
 };
 
 pub(crate) const CUSTOM_TITLEBAR: bool = cfg!(all(target_os = "windows", not(debug_assertions)));
@@ -95,6 +97,32 @@ enum NodeMenuKind {
 struct EditorModal {
     target: EditTarget,
     format: TextFormat,
+    ai_open: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AiDocDialog {
+    include_images: bool,
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AiDocDrag {
+    start_x: f32,
+    start_y: f32,
+    dialog_x: f32,
+    dialog_y: f32,
+}
+
+enum AiStreamEvent {
+    Delta(String),
+    Finished(anyhow::Result<()>),
+}
+
+enum AiDocStreamEvent {
+    Progress(ai::AiBoardStreamEvent),
+    Finished(anyhow::Result<ai::AiBoardPlan>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,6 +170,47 @@ struct EditorResize {
     start_height: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AiInputResize {
+    start_y: f32,
+    start_height: f32,
+}
+
+const BOARD_SCROLLBAR_INSET: f32 = 8.0;
+const BOARD_SCROLLBAR_THICKNESS: f32 = 9.0;
+const BOARD_SCROLLBAR_GAP: f32 = 4.0;
+const BOARD_SCROLLBAR_MIN_THUMB: f32 = 28.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoardScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BoardScrollDrag {
+    axis: BoardScrollAxis,
+    start_position: f32,
+    start_pan: f32,
+    scroll_span: f32,
+    thumb_range: f32,
+    pan_min: f32,
+    pan_max: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BoardScrollbarMetrics {
+    axis: BoardScrollAxis,
+    track_start: f32,
+    track_length: f32,
+    thumb_offset: f32,
+    thumb_length: f32,
+    scroll_span: f32,
+    thumb_range: f32,
+    pan_min: f32,
+    pan_max: f32,
+}
+
 pub struct WhiteboardApp {
     root: PathBuf,
     entries: Vec<TreeEntry>,
@@ -155,6 +224,7 @@ pub struct WhiteboardApp {
     group_drag: Option<GroupDrag>,
     rotated_svg_cache: RefCell<HashMap<u64, Arc<Image>>>,
     board_bounds: Option<Bounds<Pixels>>,
+    board_scroll_drag: Option<BoardScrollDrag>,
     interaction: Interaction,
     settings: AppSettings,
     settings_open: bool,
@@ -165,6 +235,25 @@ pub struct WhiteboardApp {
     rename_input: Entity<InputState>,
     title_input: Entity<InputState>,
     body_input: Entity<TextareaState>,
+    ai_input: Entity<TextareaState>,
+    ai_base_input: Entity<InputState>,
+    ai_key_input: Entity<InputState>,
+    ai_model_input: Entity<InputState>,
+    ai_image_model_input: Entity<InputState>,
+    ai_doc_input: Entity<TextareaState>,
+    ai_doc_dialog: Option<AiDocDialog>,
+    ai_doc_drag: Option<AiDocDrag>,
+    ai_doc_input_height: f32,
+    ai_doc_resize: Option<AiInputResize>,
+    ai_doc_thinking: String,
+    ai_doc_thinking_scroll: ScrollHandle,
+    ai_doc_loading: bool,
+    ai_doc_request_id: u64,
+    ai_loading: bool,
+    ai_request_id: u64,
+    ai_input_height: f32,
+    ai_input_resize: Option<AiInputResize>,
+    last_editor_scroll_y: i32,
     accent_input: Entity<InputState>,
     background_input: Entity<InputState>,
     foreground_input: Entity<InputState>,
@@ -177,6 +266,8 @@ pub struct WhiteboardApp {
     editor_width: f32,
     editor_height: f32,
     editor_resize: Option<EditorResize>,
+    preview_scroll: ScrollHandle,
+    connection_source: Option<Uuid>,
     status: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -218,6 +309,45 @@ impl WhiteboardApp {
                     "Write Markdown or plain text here...",
                 ))
         });
+        let ai_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(2)
+                .soft_wrap(true)
+                .placeholder(language.pick(
+                    "告诉 AI 你想写什么，按 Enter 发送，Shift+Enter 换行",
+                    "Tell the AI what to write. Enter sends, Shift+Enter adds a line.",
+                ))
+        });
+        let ai_base_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.ai.base_url.clone())
+                .placeholder("https://api.openai.com/v1")
+        });
+        let ai_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.ai.api_key.clone())
+                .masked(true)
+                .placeholder("sk-...")
+        });
+        let ai_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.ai.model.clone())
+                .placeholder("gpt-4o-mini")
+        });
+        let ai_image_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.ai.image_model.clone())
+                .placeholder("dall-e-3")
+        });
+        let ai_doc_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .soft_wrap(true)
+                .placeholder(language.pick(
+                    "输入要生成的文档主题或要求…",
+                    "Describe the document you want the AI to build...",
+                ))
+        });
         let accent_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(settings.theme.accent.clone().unwrap_or_default())
@@ -244,6 +374,7 @@ impl WhiteboardApp {
                 .placeholder("#E5E5E5")
         });
 
+        let initial_editor_width = if settings.live_preview { 980.0 } else { 760.0 };
         let mut this = Self {
             root: root.clone(),
             entries,
@@ -257,6 +388,7 @@ impl WhiteboardApp {
             group_drag: None,
             rotated_svg_cache: RefCell::new(HashMap::new()),
             board_bounds: None,
+            board_scroll_drag: None,
             interaction: Interaction::None,
             settings,
             settings_open: false,
@@ -267,6 +399,25 @@ impl WhiteboardApp {
             rename_input: rename_input.clone(),
             title_input: title_input.clone(),
             body_input: body_input.clone(),
+            ai_input: ai_input.clone(),
+            ai_base_input: ai_base_input.clone(),
+            ai_key_input: ai_key_input.clone(),
+            ai_model_input: ai_model_input.clone(),
+            ai_image_model_input: ai_image_model_input.clone(),
+            ai_doc_input: ai_doc_input.clone(),
+            ai_doc_dialog: None,
+            ai_doc_drag: None,
+            ai_doc_input_height: 120.0,
+            ai_doc_resize: None,
+            ai_doc_thinking: String::new(),
+            ai_doc_thinking_scroll: ScrollHandle::new(),
+            ai_doc_loading: false,
+            ai_doc_request_id: 0,
+            ai_loading: false,
+            ai_request_id: 0,
+            ai_input_height: 64.0,
+            ai_input_resize: None,
+            last_editor_scroll_y: i32::MIN,
             accent_input: accent_input.clone(),
             background_input: background_input.clone(),
             foreground_input: foreground_input.clone(),
@@ -276,9 +427,11 @@ impl WhiteboardApp {
             rename_dialog: None,
             delete_dialog: None,
             editor: None,
-            editor_width: 760.0,
+            editor_width: initial_editor_width,
             editor_height: 600.0,
             editor_resize: None,
+            preview_scroll: ScrollHandle::new(),
+            connection_source: None,
             status,
             _subscriptions: Vec::new(),
         };
@@ -295,6 +448,20 @@ impl WhiteboardApp {
                     this.save_editor(window, cx);
                 }
             });
+        let ai_subscription = cx.subscribe_in(&ai_input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                this.send_ai_prompt(window, cx);
+            }
+        });
+        let body_subscription = cx.subscribe_in(&body_input, window, |this, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) && this.editor.is_some() {
+                cx.notify();
+            }
+        });
+        let preview_scroll_subscription =
+            cx.observe_in(&body_input, window, |this, input, window, cx| {
+                this.sync_preview_scroll(&input, window, cx);
+            });
         let rename_subscription =
             cx.subscribe_in(&rename_input, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -303,6 +470,9 @@ impl WhiteboardApp {
             });
         this._subscriptions.push(create_subscription);
         this._subscriptions.push(title_subscription);
+        this._subscriptions.push(ai_subscription);
+        this._subscriptions.push(body_subscription);
+        this._subscriptions.push(preview_scroll_subscription);
         this._subscriptions.push(rename_subscription);
 
         this.refresh_tree();
@@ -401,6 +571,16 @@ impl WhiteboardApp {
                 cx,
             );
         });
+        self.ai_input.update(cx, |state, cx| {
+            state.set_placeholder(
+                language.pick(
+                    "告诉 AI 你想写什么，按 Enter 发送，Shift+Enter 换行",
+                    "Tell the AI what to write. Enter sends, Shift+Enter adds a line.",
+                ),
+                window,
+                cx,
+            );
+        });
     }
 
     fn set_language(&mut self, language: Language, window: &mut Window, cx: &mut Context<Self>) {
@@ -409,6 +589,810 @@ impl WhiteboardApp {
         self.update_input_placeholders(window, cx);
         window.set_window_title(language.pick("白板笔记", "Whiteboard Notes"));
         self.status = language.pick("语言已切换", "Language changed").to_string();
+        cx.notify();
+    }
+
+    fn save_ai_settings(&mut self, cx: &mut Context<Self>) {
+        let base_url = self.ai_base_input.read(cx).value().trim().to_string();
+        let api_key = self.ai_key_input.read(cx).value().trim().to_string();
+        let model = self.ai_model_input.read(cx).value().trim().to_string();
+        let image_model = self
+            .ai_image_model_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if base_url.is_empty() || model.is_empty() {
+            self.status = self
+                .tr(
+                    "AI 服务地址和模型名称不能为空",
+                    "AI base URL and model name cannot be empty",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+        self.settings.ai = AiSettings {
+            base_url,
+            api_key,
+            model,
+            image_model,
+        };
+        self.status = match self.settings.save() {
+            Ok(()) => self
+                .tr("AI 服务商设置已保存", "AI provider settings saved")
+                .to_string(),
+            Err(error) => format!("Failed to save AI settings: {error:#}"),
+        };
+        cx.notify();
+    }
+
+    fn send_ai_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_loading {
+            return;
+        }
+        let Some(editor) = self.editor else {
+            return;
+        };
+        if !matches!(editor.target, EditTarget::Note | EditTarget::Text(_)) {
+            return;
+        }
+
+        let prompt = self.ai_input.read(cx).value().trim().to_string();
+        if prompt.is_empty() {
+            self.status = self
+                .tr(
+                    "请输入想让 AI 写作的内容",
+                    "Enter a writing prompt for the AI",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+
+        let ai = self.settings.ai.clone();
+        if ai.base_url.trim().is_empty() || ai.model.trim().is_empty() {
+            self.status = self
+                .tr(
+                    "请先在设置中配置 AI 服务商",
+                    "Configure an AI provider in Settings first",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+
+        let current_content = self.body_input.read(cx).value().to_string();
+        let base_content = current_content.clone();
+        self.ai_request_id = self.ai_request_id.wrapping_add(1);
+        let request_id = self.ai_request_id;
+        self.ai_loading = true;
+        self.status = self.tr("AI 正在生成内容……", "AI is writing...").to_string();
+        self.ai_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        cx.notify();
+
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        cx.spawn_in(window, async move |this, cx| {
+            std::thread::spawn(move || {
+                let result = ai::stream_ai_text(&ai, &current_content, &prompt, |delta| {
+                    let _ = sender.unbounded_send(AiStreamEvent::Delta(delta.to_string()));
+                });
+                let _ = sender.unbounded_send(AiStreamEvent::Finished(result));
+            });
+
+            let mut output = String::new();
+            while let Some(event) = receiver.next().await {
+                match event {
+                    AiStreamEvent::Delta(delta) => {
+                        output.push_str(&delta);
+                        let text = append_ai_content(&base_content, &output);
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if this.ai_request_id != request_id {
+                                return;
+                            }
+                            this.body_input.update(cx, |state, cx| {
+                                state.set_value(text, window, cx);
+                                scroll_editor_to_bottom(state, cx);
+                            });
+                            cx.notify();
+                        });
+                    }
+                    AiStreamEvent::Finished(result) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if this.ai_request_id != request_id {
+                                return;
+                            }
+                            this.ai_loading = false;
+                            match result {
+                                Ok(()) => {
+                                    let text = append_ai_content(&base_content, &output);
+                                    this.body_input.update(cx, |state, cx| {
+                                        state.set_value(text, window, cx);
+                                        scroll_editor_to_bottom(state, cx);
+                                        state.focus(window, cx);
+                                    });
+                                    this.status = this
+                                        .tr("AI 内容已写入编辑区", "AI content inserted")
+                                        .to_string();
+                                }
+                                Err(error) => {
+                                    this.status = format!("AI request failed: {error:#}");
+                                }
+                            }
+                            cx.notify();
+                        });
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn open_ai_doc_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_doc_loading {
+            self.status = self
+                .tr(
+                    "AI 正在生成文档，请稍候…",
+                    "AI is already generating a document...",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+        if self.note.is_none() {
+            self.status = self.tr("请先打开一篇笔记", "Open a note first").to_string();
+            cx.notify();
+            return;
+        }
+        let ai = &self.settings.ai;
+        if ai.base_url.trim().is_empty() || ai.model.trim().is_empty() {
+            self.status = self
+                .tr(
+                    "请先在设置中配置 AI 服务",
+                    "Configure an AI provider in Settings first",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+        let viewport = window.viewport_size();
+        let dialog_width = 560.0;
+        let dialog_height = self.ai_doc_input_height + 280.0;
+        let x = ((f32::from(viewport.width) - dialog_width) / 2.0).max(8.0);
+        let y = ((f32::from(viewport.height) - dialog_height) / 2.0).max(8.0);
+        self.ai_doc_dialog = Some(AiDocDialog {
+            include_images: true,
+            x,
+            y,
+        });
+        self.ai_doc_drag = None;
+        self.ai_doc_resize = None;
+        self.ai_doc_input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn start_ai_doc_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.ai_doc_dialog else {
+            return;
+        };
+        self.ai_doc_drag = Some(AiDocDrag {
+            start_x: f32::from(event.position.x),
+            start_y: f32::from(event.position.y),
+            dialog_x: dialog.x,
+            dialog_y: dialog.y,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn start_ai_doc_input_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_doc_resize = Some(AiInputResize {
+            start_y: f32::from(event.position.y),
+            start_height: self.ai_doc_input_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn ai_doc_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            let changed = self.ai_doc_drag.take().is_some() | self.ai_doc_resize.take().is_some();
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
+
+        if let Some(resize) = self.ai_doc_resize {
+            let max_height = (f32::from(window.viewport_size().height) * 0.45).max(96.0);
+            let height = (resize.start_height + (f32::from(event.position.y) - resize.start_y))
+                .clamp(64.0, max_height);
+            if (self.ai_doc_input_height - height).abs() > 0.01 {
+                self.ai_doc_input_height = height;
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(drag) = self.ai_doc_drag else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let estimated_height = if self.ai_doc_loading {
+            470.0
+        } else {
+            self.ai_doc_input_height + 280.0
+        };
+        let max_x = (f32::from(viewport.width) - 560.0).max(8.0);
+        let max_y = (f32::from(viewport.height) - estimated_height).max(8.0);
+        if let Some(dialog) = &mut self.ai_doc_dialog {
+            dialog.x =
+                (drag.dialog_x + f32::from(event.position.x) - drag.start_x).clamp(8.0, max_x);
+            dialog.y =
+                (drag.dialog_y + f32::from(event.position.y) - drag.start_y).clamp(8.0, max_y);
+            cx.notify();
+        }
+    }
+
+    fn finish_ai_doc_interactions(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.ai_doc_drag.take().is_some() | self.ai_doc_resize.take().is_some();
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn append_ai_doc_thinking(&mut self, text: &str) {
+        self.ai_doc_thinking.push_str(text);
+        if self.ai_doc_thinking.len() > 48_000 {
+            let skip = self.ai_doc_thinking.chars().count().saturating_sub(32_000);
+            self.ai_doc_thinking = self.ai_doc_thinking.chars().skip(skip).collect();
+        }
+        self.ai_doc_thinking_scroll.scroll_to_bottom();
+    }
+
+    fn ai_doc_thinking_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+            ScrollDelta::Lines(delta) => delta.y * 24.0,
+        };
+        let max = f32::from(self.ai_doc_thinking_scroll.max_offset().y).max(0.0);
+        let current = f32::from(self.ai_doc_thinking_scroll.offset().y);
+        let target = (current + delta).clamp(-max, 0.0);
+        if (current - target).abs() > 0.01 {
+            self.ai_doc_thinking_scroll
+                .set_offset(point(px(0.), px(target)));
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn ai_doc_stage_text(&self, stage: &ai::AiBoardStage) -> String {
+        match stage {
+            ai::AiBoardStage::Connecting => self
+                .tr("正在连接 AI 服务…", "Connecting to the AI service...")
+                .to_string(),
+            ai::AiBoardStage::Planning => self
+                .tr(
+                    "正在理解主题并规划节点…",
+                    "Planning the document structure...",
+                )
+                .to_string(),
+            ai::AiBoardStage::Parsing => self
+                .tr("正在整理节点与连接…", "Building nodes and connections...")
+                .to_string(),
+            ai::AiBoardStage::GeneratingImage { index, total } => {
+                if self.is_zh() {
+                    format!("正在生成配图 {index}/{total}…")
+                } else {
+                    format!("Generating image {index}/{total}...")
+                }
+            }
+        }
+    }
+
+    fn cancel_ai_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai_doc_request_id = self.ai_doc_request_id.wrapping_add(1);
+        self.ai_doc_loading = false;
+        self.ai_doc_dialog = None;
+        self.ai_doc_drag = None;
+        self.ai_doc_resize = None;
+        self.status = self
+            .tr("已取消 AI 文档生成", "AI document generation cancelled")
+            .to_string();
+        self.board_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn generate_ai_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_doc_loading {
+            return;
+        }
+        if self.note.is_none() {
+            self.status = self.tr("请先打开一篇笔记", "Open a note first").to_string();
+            cx.notify();
+            return;
+        }
+        let prompt = self.ai_doc_input.read(cx).value().trim().to_string();
+        if prompt.is_empty() {
+            self.status = self
+                .tr(
+                    "请输入要生成的文档主题或要求",
+                    "Describe the document you want the AI to build",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+        let ai = self.settings.ai.clone();
+        if ai.base_url.trim().is_empty() || ai.model.trim().is_empty() {
+            self.status = self
+                .tr(
+                    "请先在设置中配置 AI 服务",
+                    "Configure an AI provider in Settings first",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+        let Some(dialog) = self.ai_doc_dialog else {
+            return;
+        };
+        let root = self.root.clone();
+        let note_path = self.note.as_ref().map(|note| note.path.clone());
+        self.ai_doc_request_id = self.ai_doc_request_id.wrapping_add(1);
+        let request_id = self.ai_doc_request_id;
+        self.ai_doc_loading = true;
+        self.ai_doc_thinking.clear();
+        self.ai_doc_drag = None;
+        self.ai_doc_resize = None;
+        self.status = self
+            .tr(
+                "AI 正在思考并规划画板文档…",
+                "AI is thinking and planning the board document...",
+            )
+            .to_string();
+        cx.notify();
+
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        cx.spawn_in(window, async move |this, cx| {
+            std::thread::spawn(move || {
+                let result =
+                    ai::stream_board_plan(&ai, &prompt, dialog.include_images, &root, |event| {
+                        let _ = sender.unbounded_send(AiDocStreamEvent::Progress(event));
+                    });
+                let _ = sender.unbounded_send(AiDocStreamEvent::Finished(result));
+            });
+
+            while let Some(event) = receiver.next().await {
+                let finished = matches!(event, AiDocStreamEvent::Finished(_));
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if this.ai_doc_request_id != request_id {
+                        return;
+                    }
+                    match event {
+                        AiDocStreamEvent::Progress(ai::AiBoardStreamEvent::Reasoning(delta)) => {
+                            this.append_ai_doc_thinking(&delta);
+                        }
+                        AiDocStreamEvent::Progress(ai::AiBoardStreamEvent::Stage(stage)) => {
+                            let label = this.ai_doc_stage_text(&stage);
+                            this.status = label.clone();
+                            this.append_ai_doc_thinking(&format!("\n[{label}]\n"));
+                        }
+                        AiDocStreamEvent::Finished(result) => {
+                            if this.note.as_ref().map(|note| &note.path) != note_path.as_ref() {
+                                this.ai_doc_loading = false;
+                                this.ai_doc_dialog = None;
+                                this.status = this
+                                    .tr(
+                                        "打开的画板已切换，AI 文档生成结果已丢弃",
+                                        "The open board changed, so the AI document was discarded",
+                                    )
+                                    .to_string();
+                                cx.notify();
+                                return;
+                            }
+                            this.ai_doc_loading = false;
+                            match result {
+                                Ok(plan) => {
+                                    this.ai_doc_dialog = None;
+                                    this.apply_ai_board_plan(plan, window, cx);
+                                }
+                                Err(error) => {
+                                    this.status =
+                                        format!("AI document generation failed: {error:#}");
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_ai_board_plan(
+        &mut self,
+        plan: ai::AiBoardPlan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let font_family = cx.theme().font_family.clone();
+        let Some(note) = &mut self.note else {
+            return;
+        };
+
+        let (base_x, base_y) = if note.board.nodes.is_empty() {
+            (96.0, 96.0)
+        } else {
+            let max_x = note
+                .board
+                .nodes
+                .iter()
+                .map(|node| node.x + node.w)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_y = note
+                .board
+                .nodes
+                .iter()
+                .map(|node| node.y)
+                .fold(f32::INFINITY, f32::min);
+            (max_x + 160.0, min_y)
+        };
+
+        let text_width = 380.0;
+        let mut ids = HashMap::new();
+        let mut created = Vec::new();
+        let mut text_ids = Vec::new();
+        let mut text_count = 0usize;
+        let mut text_y = base_y;
+
+        for plan_node in plan.nodes.iter().filter(|node| node.node_type == "text") {
+            let content = if plan_node.content.trim().is_empty() {
+                plan_node.title.clone()
+            } else {
+                plan_node.content.clone()
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            let mut node = BoardNode::text(base_x, text_y, content.clone(), TextFormat::Markdown);
+            node.w = text_width;
+            node.auto_height = true;
+            node.h = measure_text_card_height(&node, &content, window, &font_family);
+            text_y += node.h + 40.0;
+            ids.insert(plan_node.id.clone(), node.id);
+            created.push(node.id);
+            text_ids.push(node.id);
+            text_count += 1;
+            note.board.nodes.push(node);
+        }
+
+        let mut mind_drafts = Vec::new();
+        let mut mind_plan_ids = HashSet::new();
+        for plan_node in plan.nodes.iter().filter(|node| node.node_type == "mind") {
+            let title = if plan_node.title.trim().is_empty() {
+                plan_node.content.lines().next().unwrap_or("").trim()
+            } else {
+                plan_node.title.trim()
+            };
+            if title.is_empty() {
+                continue;
+            }
+            let mut node = BoardNode::mind(0.0, 0.0, title, None);
+            node.w = 220.0;
+            fit_mind_node_height(&mut node, window, &font_family);
+            ids.insert(plan_node.id.clone(), node.id);
+            mind_plan_ids.insert(plan_node.id.clone());
+            mind_drafts.push(AiMindDraft {
+                plan_id: plan_node.id.clone(),
+                node,
+                parent_plan: plan_node.parent.clone(),
+            });
+        }
+
+        for draft in &mut mind_drafts {
+            if let Some(parent_plan) = &draft.parent_plan
+                && mind_plan_ids.contains(parent_plan)
+                && let Some(parent_id) = ids.get(parent_plan)
+                && let NodeKind::Mind { parent, .. } = &mut draft.node.kind
+            {
+                *parent = Some(*parent_id);
+            }
+        }
+
+        let (mind_children, mind_roots) = ai_mind_children(&mind_drafts);
+        let mind_base_x = if text_count > 0 {
+            base_x + text_width + 100.0
+        } else {
+            base_x
+        };
+        let mut mind_memo = HashMap::new();
+        let mut mind_cursor_y = base_y;
+        for root in &mind_roots {
+            let height =
+                ai_mind_subtree_height(&mind_drafts, *root, &mind_children, &mut mind_memo);
+            ai_layout_mind_subtree(
+                &mut mind_drafts,
+                *root,
+                0,
+                mind_cursor_y,
+                mind_base_x,
+                &mind_children,
+                &mut mind_memo,
+            );
+            mind_cursor_y += height + 60.0;
+        }
+
+        let mut image_x = mind_base_x;
+        for draft in &mind_drafts {
+            image_x = image_x.max(draft.node.x + draft.node.w + 100.0);
+        }
+        if mind_drafts.is_empty() && text_count > 0 {
+            image_x = base_x + text_width + 100.0;
+        }
+
+        let mind_count = mind_drafts.len();
+        let first_mind_root_id = mind_roots
+            .first()
+            .and_then(|index| mind_drafts.get(*index))
+            .map(|draft| draft.node.id);
+        for draft in mind_drafts {
+            created.push(draft.node.id);
+            note.board.nodes.push(draft.node);
+        }
+
+        let mut image_count = 0usize;
+        let mut image_y = base_y;
+        for plan_node in plan.nodes.iter().filter(|node| node.node_type == "image") {
+            let Some(path) = plan_node.image_path.as_ref() else {
+                continue;
+            };
+            let (width, height) = fit_image(
+                plan_node.image_width.max(1.0),
+                plan_node.image_height.max(1.0),
+            );
+            let node = BoardNode::image(image_x, image_y, path.clone(), width, height);
+            image_y += height + 32.0;
+            ids.insert(plan_node.id.clone(), node.id);
+            created.push(node.id);
+            image_count += 1;
+            note.board.nodes.push(node);
+        }
+
+        let mut connection_count = 0usize;
+        for connection in &plan.connections {
+            let (Some(&from), Some(&to)) = (ids.get(&connection.from), ids.get(&connection.to))
+            else {
+                continue;
+            };
+            if from == to
+                || note
+                    .board
+                    .connections
+                    .iter()
+                    .any(|existing| existing.from == from && existing.to == to)
+            {
+                continue;
+            }
+            note.board.connections.push(NodeConnection::new(from, to));
+            connection_count += 1;
+        }
+
+        if connection_count == 0 {
+            let before = note.board.connections.len();
+            auto_connect_generated_nodes(
+                &mut note.board.connections,
+                &text_ids,
+                first_mind_root_id,
+            );
+            connection_count += note.board.connections.len() - before;
+        }
+
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for id in &created {
+            if let Some(node) = note.board.node(*id) {
+                min_x = min_x.min(node.x);
+                min_y = min_y.min(node.y);
+                max_x = max_x.max(node.x + node.w);
+                max_y = max_y.max(node.y + node.h);
+            }
+        }
+        let save_result = note.save_board();
+        let total = created.len();
+        let plan_title = plan.title.trim().to_string();
+
+        if created.is_empty() {
+            self.status = self
+                .tr(
+                    "AI 没有生成可用的节点",
+                    "AI did not produce any usable nodes",
+                )
+                .to_string();
+            self.board_focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+
+        self.multi_selected.clear();
+        self.group_drag = None;
+        self.connection_source = None;
+        self.selected_node = created.first().copied();
+        self.focus_generated_rect(min_x, min_y, max_x, max_y);
+        self.board_focus.focus(window, cx);
+        self.status = if let Err(error) = save_result {
+            format!("AI nodes were added but saving failed: {error:#}")
+        } else if self.is_zh() {
+            let image_note = if plan.image_failures > 0 {
+                format!("，{} 张图片生成失败已跳过", plan.image_failures)
+            } else {
+                String::new()
+            };
+            let title = if plan_title.is_empty() {
+                String::new()
+            } else {
+                format!("《{plan_title}》")
+            };
+            format!(
+                "AI 已生成{title} {total} 个节点：{text_count} 张文本、{mind_count} 个思维导图节点、{image_count} 张图片，{connection_count} 条连接{image_note}"
+            )
+        } else {
+            let image_note = if plan.image_failures > 0 {
+                format!(
+                    "; {} image(s) could not be generated and were skipped",
+                    plan.image_failures
+                )
+            } else {
+                String::new()
+            };
+            let title = if plan_title.is_empty() {
+                String::new()
+            } else {
+                format!(" \"{plan_title}\":")
+            };
+            format!(
+                "AI generated{title} {total} nodes: {text_count} text, {mind_count} mind map, {image_count} image(s), {connection_count} connection(s){image_note}"
+            )
+        };
+        cx.notify();
+    }
+
+    fn focus_generated_rect(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+        let Some(bounds) = self.board_bounds else {
+            return;
+        };
+        let Some(note) = &mut self.note else {
+            return;
+        };
+        let viewport_width = f32::from(bounds.size.width);
+        let viewport_height = f32::from(bounds.size.height);
+        if viewport_width <= 1.0 || viewport_height <= 1.0 {
+            return;
+        }
+        let margin = 56.0;
+        let width = (max_x - min_x).max(1.0);
+        let height = (max_y - min_y).max(1.0);
+        let fit_zoom = ((viewport_width - margin * 2.0).max(40.0) / width)
+            .min((viewport_height - margin * 2.0).max(40.0) / height);
+        let zoom = fit_zoom.clamp(0.2, note.board.camera.zoom.max(0.2));
+        note.board.camera.zoom = zoom;
+        note.board.camera.pan_x = margin - min_x * zoom;
+        note.board.camera.pan_y = margin - min_y * zoom;
+    }
+
+    fn set_floating_scrollbars(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.floating_scrollbars = enabled;
+        let _ = self.settings.save();
+        self.status = if enabled {
+            self.tr("画板浮动滚动条已开启", "Floating board scrollbars enabled")
+                .to_string()
+        } else {
+            self.tr("画板浮动滚动条已关闭", "Floating board scrollbars disabled")
+                .to_string()
+        };
+        cx.notify();
+    }
+
+    fn start_board_scroll_drag(
+        &mut self,
+        metrics: BoardScrollbarMetrics,
+        position: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(note) = &self.note else {
+            return;
+        };
+        if metrics.thumb_range <= 0.5 || metrics.scroll_span <= 0.5 {
+            return;
+        }
+        let start_pan = match metrics.axis {
+            BoardScrollAxis::Vertical => note.board.camera.pan_y,
+            BoardScrollAxis::Horizontal => note.board.camera.pan_x,
+        };
+        self.board_scroll_drag = Some(BoardScrollDrag {
+            axis: metrics.axis,
+            start_position: position,
+            start_pan,
+            scroll_span: metrics.scroll_span,
+            thumb_range: metrics.thumb_range,
+            pan_min: metrics.pan_min,
+            pan_max: metrics.pan_max,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn jump_board_scroll(
+        &mut self,
+        metrics: BoardScrollbarMetrics,
+        position: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(note) = &mut self.note else {
+            return;
+        };
+        let progress = ((position - metrics.track_start - metrics.thumb_length / 2.0)
+            / metrics.thumb_range.max(1.0))
+        .clamp(0.0, 1.0);
+        let pan = (metrics.pan_max - progress * metrics.scroll_span)
+            .clamp(metrics.pan_min, metrics.pan_max);
+        match metrics.axis {
+            BoardScrollAxis::Vertical => note.board.camera.pan_y = pan,
+            BoardScrollAxis::Horizontal => note.board.camera.pan_x = pan,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_live_preview(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.live_preview = enabled;
+        if enabled {
+            self.editor_width = self.editor_width.max(980.0);
+        }
+        let _ = self.settings.save();
+        self.status = if enabled {
+            self.tr("已开启编辑器实时预览", "Live editor preview enabled")
+                .to_string()
+        } else {
+            self.tr("已关闭编辑器实时预览", "Live editor preview disabled")
+                .to_string()
+        };
         cx.notify();
     }
 
@@ -651,6 +1635,7 @@ impl WhiteboardApp {
         }
 
         self.save_current();
+        self.connection_source = None;
 
         match NoteDoc::load(path) {
             Ok(mut note) => {
@@ -663,8 +1648,14 @@ impl WhiteboardApp {
                 self.selected_note = Some(note.path.clone());
                 self.selected_tree = Some(note.path.clone());
                 self.selected_dir = None;
+                let note_id = note.note_id;
+                let has_note_card = note.board.node(note_id).is_some();
                 self.note = Some(note);
-                self.select_single_node(self.note.as_ref().unwrap().note_id);
+                if has_note_card {
+                    self.select_single_node(note_id);
+                } else {
+                    self.clear_node_selection();
+                }
                 self.interaction = Interaction::None;
 
                 if should_fit {
@@ -1112,11 +2103,38 @@ impl WhiteboardApp {
         }
     }
 
+    fn open_ai_editor(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_editor_for_node(id, window, cx);
+        let opened = if let Some(editor) = &mut self.editor {
+            if matches!(editor.target, EditTarget::Note | EditTarget::Text(_)) {
+                editor.ai_open = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if opened {
+            let input = self.ai_input.clone();
+            window.defer(cx, move |window, cx| {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+        }
+        cx.notify();
+    }
+
     fn open_editor_for_node(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(note) = &self.note else {
             return;
         };
         self.editor_resize = None;
+        self.ai_loading = false;
+        self.ai_request_id = self.ai_request_id.wrapping_add(1);
+        self.last_editor_scroll_y = i32::MIN;
+        self.ai_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
         let Some(node) = note.board.node(id) else {
             return;
         };
@@ -1128,6 +2146,7 @@ impl WhiteboardApp {
                 self.editor = Some(EditorModal {
                     target: EditTarget::Note,
                     format,
+                    ai_open: false,
                 });
                 self.body_input.update(cx, |state, cx| {
                     state.set_value(content, window, cx);
@@ -1143,6 +2162,7 @@ impl WhiteboardApp {
                 self.editor = Some(EditorModal {
                     target: EditTarget::Text(id),
                     format,
+                    ai_open: false,
                 });
                 self.body_input.update(cx, |state, cx| {
                     state.set_value(content, window, cx);
@@ -1157,6 +2177,7 @@ impl WhiteboardApp {
                 self.editor = Some(EditorModal {
                     target: EditTarget::Mind(id),
                     format: TextFormat::Plain,
+                    ai_open: false,
                 });
                 self.title_input.update(cx, |state, cx| {
                     state.set_value(title, window, cx);
@@ -1176,12 +2197,33 @@ impl WhiteboardApp {
     }
 
     fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self
-            .selected_node
-            .or_else(|| self.note.as_ref().map(|note| note.note_id));
-        if let Some(id) = target {
+        if let Some(id) = self.selected_node
+            && self
+                .note
+                .as_ref()
+                .is_some_and(|note| note.board.node(id).is_some())
+        {
             self.open_editor_for_node(id, window, cx);
+            return;
         }
+        let Some(note) = &self.note else {
+            return;
+        };
+        let content = note.content.clone();
+        let format = note.format;
+        self.editor = Some(EditorModal {
+            target: EditTarget::Note,
+            format,
+            ai_open: false,
+        });
+        self.body_input.update(cx, |state, cx| {
+            state.set_value(content, window, cx);
+        });
+        let input = self.body_input.clone();
+        window.defer(cx, move |window, cx| {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.notify();
     }
 
     fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1189,14 +2231,24 @@ impl WhiteboardApp {
             return;
         };
         self.editor_resize = None;
+        self.ai_loading = false;
+        self.ai_request_id = self.ai_request_id.wrapping_add(1);
         let zh = self.is_zh();
 
         match editor.target {
             EditTarget::Note => {
                 let value = self.body_input.read(cx).value().to_string();
+                let font_family = cx.theme().font_family.clone();
                 if let Some(note) = &mut self.note {
                     note.content = value;
+                    let note_id = note.note_id;
+                    let content = note.content.clone();
                     note.sync_note_content();
+                    if let Some(node) = note.board.node_mut(note_id)
+                        && node.auto_height
+                    {
+                        node.h = measure_text_card_height(node, &content, window, &font_family);
+                    }
                     let mut error = None;
                     if let Err(save_error) = note.save_content() {
                         error = Some(if zh {
@@ -1224,12 +2276,16 @@ impl WhiteboardApp {
             EditTarget::Text(id) => {
                 let value = self.body_input.read(cx).value().to_string();
                 let format = editor.format;
+                let font_family = cx.theme().font_family.clone();
                 if let Some(note) = &mut self.note {
                     if let Some(node) = note.board.node_mut(id) {
                         node.kind = NodeKind::Text {
-                            content: value,
+                            content: value.clone(),
                             format,
                         };
+                        if node.auto_height {
+                            node.h = measure_text_card_height(node, &value, window, &font_family);
+                        }
                     }
                     self.status = match note.save_board() {
                         Ok(()) if zh => "文本卡片已保存".to_string(),
@@ -1274,6 +2330,8 @@ impl WhiteboardApp {
     fn cancel_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor = None;
         self.editor_resize = None;
+        self.ai_loading = false;
+        self.ai_request_id = self.ai_request_id.wrapping_add(1);
         self.board_focus.focus(window, cx);
         cx.notify();
     }
@@ -1342,11 +2400,7 @@ impl WhiteboardApp {
         let mut node = BoardNode::mind(
             0.0,
             0.0,
-            if zh {
-                "��������"
-            } else {
-                "Central topic"
-            },
+            if zh { "中心主题" } else { "Central topic" },
             None,
         );
         fit_mind_node_height(&mut node, window, &font_family);
@@ -1417,7 +2471,7 @@ impl WhiteboardApp {
         let mut child = BoardNode::mind(
             parent_x + parent_w + 78.0,
             parent_y + offset_y,
-            if zh { "������" } else { "Subtopic" },
+            if zh { "子主题" } else { "Subtopic" },
             Some(selected),
         );
         fit_mind_node_height(&mut child, window, &font_family);
@@ -1438,6 +2492,138 @@ impl WhiteboardApp {
         cx.notify();
     }
 
+    fn begin_connection_from(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let connectable = self
+            .note
+            .as_ref()
+            .and_then(|note| note.board.node(id))
+            .is_some_and(is_connectable_node);
+        if !connectable {
+            self.status = self
+                .tr(
+                    "只有文本卡片和笔记卡片可以建立连接",
+                    "Only text and note cards can be connected",
+                )
+                .to_string();
+            cx.notify();
+            return;
+        }
+
+        self.connection_source = Some(id);
+        self.selected_node = Some(id);
+        self.multi_selected.clear();
+        self.group_drag = None;
+        self.interaction = Interaction::None;
+        self.status = self
+            .tr(
+                "请选择另一个文本节点作为连接目标，按 Esc 取消",
+                "Select another text node as the target, or press Esc to cancel",
+            )
+            .to_string();
+        cx.notify();
+    }
+
+    fn cancel_connection(&mut self, cx: &mut Context<Self>) {
+        self.connection_source = None;
+        self.status = self.tr("已取消连接", "Connection cancelled").to_string();
+        cx.notify();
+    }
+
+    fn create_connection(
+        &mut self,
+        from: Uuid,
+        to: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let created_status = self.tr("已创建连接", "Connection created").to_string();
+        let exists_status = self
+            .tr("这两个节点已经连接", "These nodes are already connected")
+            .to_string();
+        let invalid_status = self
+            .tr(
+                "连接节点已不存在",
+                "The connection endpoints no longer exist",
+            )
+            .to_string();
+
+        let Some(note) = &mut self.note else {
+            return;
+        };
+        let valid = note.board.node(from).is_some_and(is_connectable_node)
+            && note.board.node(to).is_some_and(is_connectable_node)
+            && from != to;
+        if !valid {
+            self.status = invalid_status;
+        } else if note
+            .board
+            .connections
+            .iter()
+            .any(|connection| connection.from == from && connection.to == to)
+        {
+            self.status = exists_status;
+        } else {
+            note.board.connections.push(NodeConnection::new(from, to));
+            let _ = note.save_board();
+            self.status = created_status;
+        }
+
+        self.connection_source = None;
+        self.board_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn remove_node_connections(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let removed_status = self
+            .tr("已删除该节点的连接", "Removed connections for this node")
+            .to_string();
+        let none_status = self
+            .tr("该节点没有连接", "This node has no connections")
+            .to_string();
+        let Some(note) = &mut self.note else {
+            return;
+        };
+        let before = note.board.connections.len();
+        note.board
+            .connections
+            .retain(|connection| connection.from != id && connection.to != id);
+        if note.board.connections.len() == before {
+            self.status = none_status;
+        } else {
+            let _ = note.save_board();
+            self.status = removed_status;
+        }
+        self.connection_source = None;
+        cx.notify();
+    }
+
+    fn toggle_node_lock(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let zh = self.is_zh();
+        let locked = if let Some(note) = &mut self.note {
+            let Some(node) = note.board.node_mut(id) else {
+                return;
+            };
+            node.locked = !node.locked;
+            let locked = node.locked;
+            let _ = note.save_board();
+            locked
+        } else {
+            return;
+        };
+        self.status = if locked {
+            if zh {
+                "卡片已锁定".to_string()
+            } else {
+                "Card locked".to_string()
+            }
+        } else if zh {
+            "卡片已解锁".to_string()
+        } else {
+            "Card unlocked".to_string()
+        };
+        cx.notify();
+    }
+
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_node else {
             return;
@@ -1449,18 +2635,24 @@ impl WhiteboardApp {
         let Some(index) = note.board.nodes.iter().position(|node| node.id == id) else {
             return;
         };
-        if note.board.nodes[index].kind.is_note() {
+        if note.board.nodes[index].locked {
             self.status = if zh {
-                "笔记主卡片不能删除"
+                "卡片已锁定，无法删除".to_string()
             } else {
-                "The main note card cannot be deleted"
-            }
-            .to_string();
+                "The card is locked and cannot be deleted".to_string()
+            };
             cx.notify();
             return;
         }
 
+        let is_note = note.board.nodes[index].kind.is_note();
         let removed = note.board.nodes.remove(index);
+        note.board
+            .connections
+            .retain(|connection| connection.from != id && connection.to != id);
+        if self.connection_source == Some(id) {
+            self.connection_source = None;
+        }
         if removed.kind.is_mind() {
             for node in &mut note.board.nodes {
                 if let NodeKind::Mind { parent, .. } = &mut node.kind
@@ -1472,8 +2664,20 @@ impl WhiteboardApp {
         }
         self.multi_selected.clear();
         self.group_drag = None;
-        self.selected_node = Some(note.note_id);
-        self.status = if zh {
+        if is_note {
+            note.board.note_card_deleted = true;
+            note.note_id = Uuid::nil();
+            self.selected_node = None;
+        } else {
+            self.selected_node = note.board.node(note.note_id).map(|_| note.note_id);
+        }
+        self.status = if is_note {
+            if zh {
+                "已删除笔记主卡片，笔记文件仍保留".to_string()
+            } else {
+                "Main note card deleted; the note file is kept".to_string()
+            }
+        } else if zh {
             "已删除节点".to_string()
         } else {
             "Node deleted".to_string()
@@ -1518,6 +2722,41 @@ impl WhiteboardApp {
             };
             cx.notify();
         }
+    }
+
+    fn toggle_text_card_height(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let font_family = cx.theme().font_family.clone();
+        let Some(note) = &mut self.note else {
+            return;
+        };
+        let Some(node) = note.board.node_mut(id) else {
+            return;
+        };
+        if !(node.kind.is_text() || node.kind.is_note()) {
+            return;
+        }
+        let default_height = if node.kind.is_note() { 350.0 } else { 210.0 };
+        if node.auto_height {
+            node.auto_height = false;
+            node.h = default_height;
+        } else {
+            let content = match &node.kind {
+                NodeKind::Text { content, .. } | NodeKind::Note { content, .. } => content.clone(),
+                _ => return,
+            };
+            node.auto_height = true;
+            node.h = measure_text_card_height(node, &content, window, &font_family);
+        }
+        let auto_height = node.auto_height;
+        let _ = note.save_board();
+        self.status = if auto_height {
+            self.tr("卡片高度已适应内容", "Card height fitted to content")
+                .to_string()
+        } else {
+            self.tr("卡片高度已恢复默认", "Card height restored to default")
+                .to_string()
+        };
+        cx.notify();
     }
 
     fn set_node_rotation(&mut self, id: Uuid, rotation: f32, cx: &mut Context<Self>) {
@@ -1835,6 +3074,48 @@ impl WhiteboardApp {
         let local_x = f32::from(event.position.x - bounds.origin.x);
         let local_y = f32::from(event.position.y - bounds.origin.y);
 
+        if let Some(source_id) = self.connection_source {
+            let target = self.note.as_ref().and_then(|note| {
+                let (world_x, world_y) = note.board.camera.screen_to_world(local_x, local_y);
+                note.board
+                    .nodes
+                    .iter()
+                    .rev()
+                    .find(|node| node.contains(world_x, world_y))
+                    .map(|node| (node.id, is_connectable_node(node)))
+            });
+
+            match target {
+                Some((id, true)) if id != source_id => {
+                    self.create_connection(source_id, id, window, cx);
+                }
+                Some((id, _)) if id == source_id => {
+                    self.status = self
+                        .tr(
+                            "请选择另一个文本节点作为连接目标",
+                            "Select a different text node as the target",
+                        )
+                        .to_string();
+                    cx.notify();
+                }
+                Some(_) => {
+                    self.status = self
+                        .tr(
+                            "只能连接到文本卡片或笔记卡片",
+                            "Connections can only target text or note cards",
+                        )
+                        .to_string();
+                    cx.notify();
+                }
+                None => {
+                    self.connection_source = None;
+                    self.status = self.tr("已取消连接", "Connection cancelled").to_string();
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
         let resize_handle_hit = self.note.as_ref().and_then(|note| {
             let id = self.selected_node?;
             let node = note.board.node(id)?;
@@ -1986,6 +3267,29 @@ impl WhiteboardApp {
         let local_x = f32::from(event.position.x - bounds.origin.x);
         let local_y = f32::from(event.position.y - bounds.origin.y);
 
+        if let Some(drag) = self.board_scroll_drag {
+            if event.pressed_button == Some(MouseButton::Left) {
+                if drag.thumb_range > 0.5 {
+                    let position = match drag.axis {
+                        BoardScrollAxis::Vertical => local_y,
+                        BoardScrollAxis::Horizontal => local_x,
+                    };
+                    let delta = position - drag.start_position;
+                    let pan = (drag.start_pan - delta / drag.thumb_range * drag.scroll_span)
+                        .clamp(drag.pan_min, drag.pan_max);
+                    if let Some(note) = &mut self.note {
+                        match drag.axis {
+                            BoardScrollAxis::Vertical => note.board.camera.pan_y = pan,
+                            BoardScrollAxis::Horizontal => note.board.camera.pan_x = pan,
+                        }
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+            self.board_scroll_drag = None;
+        }
+
         if event.pressed_button != Some(MouseButton::Left) {
             if !matches!(self.interaction, Interaction::None) {
                 self.interaction = Interaction::None;
@@ -2062,8 +3366,8 @@ impl WhiteboardApp {
                 let delta_w = (local_x - start_x) / zoom;
                 let delta_h = (local_y - start_y) / zoom;
                 if let Some(node) = note.board.node_mut(id) {
-                    node.w = (start_w + delta_w).clamp(80.0, 2400.0);
-                    node.h = (start_h + delta_h).clamp(50.0, 2000.0);
+                    node.w = (start_w + delta_w).clamp(80.0, 10000.0);
+                    node.h = (start_h + delta_h).clamp(50.0, 20000.0);
                     cx.notify();
                 }
             }
@@ -2077,6 +3381,14 @@ impl WhiteboardApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.board_scroll_drag.take().is_some() {
+            if let Some(note) = &self.note {
+                let _ = note.save_board();
+            }
+            cx.notify();
+            return;
+        }
+
         if let Interaction::BoxSelecting {
             start_x,
             start_y,
@@ -2140,6 +3452,7 @@ impl WhiteboardApp {
                     if fit_mind_node_heights(&mut note.board.nodes, window, &font_family) {
                         resolve_mind_overlaps(&mut note.board.nodes);
                     }
+                    fit_auto_text_heights(&mut note.board.nodes, window, &font_family);
                 }
                 let _ = note.save_board();
             }
@@ -2174,7 +3487,7 @@ impl WhiteboardApp {
             note.board.camera.zoom_around(local_x, local_y, zoom);
         } else {
             note.board.camera.pan_x -= delta_x;
-            note.board.camera.pan_y -= delta_y;
+            note.board.camera.pan_y += delta_y;
         }
 
         cx.notify();
@@ -2207,7 +3520,11 @@ impl WhiteboardApp {
                 "-" => self.zoom_out(window, cx),
                 "0" => self.reset_view(window, cx),
                 "escape" => {
-                    self.clear_node_selection();
+                    if self.connection_source.take().is_some() {
+                        self.status = self.tr("已取消连接", "Connection cancelled").to_string();
+                    } else {
+                        self.clear_node_selection();
+                    }
                     cx.notify();
                 }
                 _ => {}
@@ -2232,6 +3549,71 @@ impl WhiteboardApp {
                 ))
         {
             self.save_editor(window, cx);
+        }
+    }
+
+    fn sync_preview_scroll(
+        &mut self,
+        input: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preview_active = self
+            .editor
+            .is_some_and(|editor| matches!(editor.target, EditTarget::Note | EditTarget::Text(_)));
+        if !self.settings.live_preview || !preview_active {
+            return;
+        }
+
+        let (offset_y, line_height, visible_rows, total_lines) = {
+            let state = input.read(cx);
+            (
+                state.scroll_offset().y,
+                state.line_height().unwrap_or_else(|| window.line_height()),
+                state
+                    .visible_row_range()
+                    .map(|range| range.len())
+                    .unwrap_or(1)
+                    .max(1),
+                state.value().lines().count().max(1),
+            )
+        };
+        let offset_y_i = f32::from(offset_y) as i32;
+        if offset_y_i == self.last_editor_scroll_y {
+            return;
+        }
+        self.last_editor_scroll_y = offset_y_i;
+        let ratio = preview_scroll_ratio(
+            f32::from(offset_y),
+            f32::from(line_height),
+            total_lines,
+            visible_rows,
+        );
+        let max_preview_scroll = f32::from(self.preview_scroll.max_offset().y).max(0.0);
+        let target = -max_preview_scroll * ratio;
+        if (f32::from(self.preview_scroll.offset().y) - target).abs() > 0.5 {
+            self.preview_scroll.set_offset(point(px(0.), px(target)));
+            cx.notify();
+        }
+    }
+
+    fn preview_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => f32::from(delta.y),
+            ScrollDelta::Lines(delta) => delta.y * 24.0,
+        };
+        let max = f32::from(self.preview_scroll.max_offset().y).max(0.0);
+        let current = f32::from(self.preview_scroll.offset().y);
+        let target = (current + delta).clamp(-max, 0.0);
+        if (current - target).abs() > 0.01 {
+            self.preview_scroll.set_offset(point(px(0.), px(target)));
+            cx.stop_propagation();
+            cx.notify();
         }
     }
 
@@ -2280,7 +3662,51 @@ impl WhiteboardApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editor_resize.take().is_some() {
+        let editor_changed = self.editor_resize.take().is_some();
+        let ai_changed = self.ai_input_resize.take().is_some();
+        if editor_changed || ai_changed {
+            cx.notify();
+        }
+    }
+
+    fn editor_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_resize_move(event, window, cx);
+        self.ai_input_resize_move(event, window, cx);
+    }
+
+    fn start_ai_input_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_input_resize = Some(AiInputResize {
+            start_y: f32::from(event.position.y),
+            start_height: self.ai_input_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn ai_input_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.ai_input_resize else {
+            return;
+        };
+        let max_height = (f32::from(window.viewport_size().height) * 0.35).max(96.0);
+        let height = (resize.start_height + (f32::from(event.position.y) - resize.start_y))
+            .clamp(40.0, max_height);
+        if (self.ai_input_height - height).abs() > 0.01 {
+            self.ai_input_height = height;
             cx.notify();
         }
     }
@@ -2696,6 +4122,14 @@ impl WhiteboardApp {
             .and_then(|id| self.note.as_ref().and_then(|note| note.board.node(id)))
             .map(|node| node.kind.is_note())
             .unwrap_or(false);
+        let selected_is_text = self
+            .selected_node
+            .and_then(|id| self.note.as_ref().and_then(|note| note.board.node(id)))
+            .is_some_and(is_connectable_node);
+        let selected_is_locked = self
+            .selected_node
+            .and_then(|id| self.note.as_ref().and_then(|note| note.board.node(id)))
+            .is_some_and(|node| node.locked);
         let has_selection = self.selected_node.is_some();
 
         let bg = cx.theme().background;
@@ -2768,6 +4202,25 @@ impl WhiteboardApp {
                     })),
             )
             .child(
+                Button::new("ai-document")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Bot)
+                    .label(if self.ai_doc_loading {
+                        self.tr("生成中…", "Generating...")
+                    } else {
+                        self.tr("AI 生成", "AI document")
+                    })
+                    .tooltip(self.tr(
+                        "用 AI 生成图文画板文档并自动连接节点",
+                        "Generate a structured board document with AI",
+                    ))
+                    .disabled(self.ai_doc_loading)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_ai_doc_dialog(window, cx);
+                    })),
+            )
+            .child(
                 Button::new("paste-image")
                     .ghost()
                     .small()
@@ -2797,6 +4250,57 @@ impl WhiteboardApp {
                         this.edit_selected(window, cx);
                     })),
             )
+            .when(has_selection, |this| {
+                this.child(
+                    Button::new("toggle-lock")
+                        .ghost()
+                        .small()
+                        .label(if selected_is_locked {
+                            self.tr("解锁", "Unlock")
+                        } else {
+                            self.tr("锁定", "Lock")
+                        })
+                        .selected(selected_is_locked)
+                        .tooltip(if selected_is_locked {
+                            self.tr("解锁选中的卡片", "Unlock the selected card")
+                        } else {
+                            self.tr(
+                                "锁定选中的卡片，锁定后不能删除",
+                                "Lock the selected card to prevent deletion",
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(id) = this.selected_node {
+                                this.toggle_node_lock(id, cx);
+                            }
+                        })),
+                )
+            })
+            .when(selected_is_text, |this| {
+                this.child(
+                    Button::new("connect-node")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Network)
+                        .label(if self.connection_source.is_some() {
+                            self.tr("取消连接", "Cancel")
+                        } else {
+                            self.tr("连接", "Connect")
+                        })
+                        .tooltip(self.tr(
+                            "将一个文本节点连接到另一个文本节点",
+                            "Connect this text node to another text node",
+                        ))
+                        .selected(self.connection_source.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.connection_source.is_some() {
+                                this.cancel_connection(cx);
+                            } else if let Some(id) = this.selected_node {
+                                this.begin_connection_from(id, cx);
+                            }
+                        })),
+                )
+            })
             .when(selected_is_mind && !selected_is_note, |this| {
                 this.child(
                     Button::new("add-child")
@@ -2813,14 +4317,22 @@ impl WhiteboardApp {
                         })),
                 )
             })
-            .when(has_selection && !selected_is_note, |this| {
+            .when(has_selection, |this| {
                 this.child(
                     Button::new("delete-node")
                         .ghost()
                         .small()
                         .icon(IconName::Trash)
                         .label(self.tr("删除", "Delete"))
-                        .tooltip(self.tr("删除选中的节点", "Delete the selected node"))
+                        .disabled(selected_is_locked)
+                        .tooltip(if selected_is_locked {
+                            self.tr(
+                                "卡片已锁定，无法删除",
+                                "The card is locked and cannot be deleted",
+                            )
+                        } else {
+                            self.tr("删除选中的卡片", "Delete the selected card")
+                        })
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.delete_selected(window, cx);
                         })),
@@ -2888,6 +4400,18 @@ impl WhiteboardApp {
         let primary = cx.theme().primary;
         let edge_color = cx.theme().primary.opacity(0.55);
 
+        let mut connection_edges = Vec::new();
+        for connection in &note.board.connections {
+            let Some(from) = note.board.node(connection.from) else {
+                continue;
+            };
+            let Some(to) = note.board.node(connection.to) else {
+                continue;
+            };
+            let ((start_x, start_y), (end_x, end_y)) = connection_anchors(from, to);
+            connection_edges.push((start_x, start_y, end_x, end_y));
+        }
+
         let mut elements = Vec::with_capacity(note.board.nodes.len());
         for node in &note.board.nodes {
             let (screen_x, screen_y) = camera.world_to_screen(node.x, node.y);
@@ -2919,6 +4443,9 @@ impl WhiteboardApp {
         };
 
         let resize_handle = self.note.as_ref().and_then(|note| {
+            if self.connection_source.is_some() {
+                return None;
+            }
             let id = self.selected_node?;
             let node = note.board.node(id)?;
             if !matches!(
@@ -2951,12 +4478,131 @@ impl WhiteboardApp {
             )
         });
 
+        let scrollbars = if self.settings.floating_scrollbars {
+            self.board_bounds
+                .map(|bounds| {
+                    let viewport_width = f32::from(bounds.size.width);
+                    let viewport_height = f32::from(bounds.size.height);
+                    let (vertical, horizontal) = board_scrollbar_metrics(
+                        camera,
+                        &note.board.nodes,
+                        viewport_width,
+                        viewport_height,
+                    );
+                    let origin_x = f32::from(bounds.origin.x);
+                    let origin_y = f32::from(bounds.origin.y);
+                    let track_color = border.opacity(0.35);
+                    let thumb_color = cx.theme().muted_foreground.opacity(0.55);
+                    let thumb_hover = cx.theme().muted_foreground.opacity(0.8);
+                    let mut bars = Vec::with_capacity(2);
+                    if let Some(metrics) = vertical {
+                        let left =
+                            viewport_width - BOARD_SCROLLBAR_INSET - BOARD_SCROLLBAR_THICKNESS;
+                        bars.push(
+                            div()
+                                .id("board-scrollbar-vertical-track")
+                                .absolute()
+                                .left(px(left))
+                                .top(px(metrics.track_start))
+                                .w(px(BOARD_SCROLLBAR_THICKNESS))
+                                .h(px(metrics.track_length))
+                                .rounded_full()
+                                .bg(track_color)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        let position = f32::from(event.position.y) - origin_y;
+                                        this.jump_board_scroll(metrics, position, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .id("board-scrollbar-vertical-thumb")
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(metrics.thumb_offset))
+                                        .w_full()
+                                        .h(px(metrics.thumb_length))
+                                        .rounded_full()
+                                        .bg(thumb_color)
+                                        .hover(move |style| style.bg(thumb_hover))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    let position =
+                                                        f32::from(event.position.y) - origin_y;
+                                                    this.start_board_scroll_drag(
+                                                        metrics, position, cx,
+                                                    );
+                                                },
+                                            ),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    if let Some(metrics) = horizontal {
+                        let top =
+                            viewport_height - BOARD_SCROLLBAR_INSET - BOARD_SCROLLBAR_THICKNESS;
+                        bars.push(
+                            div()
+                                .id("board-scrollbar-horizontal-track")
+                                .absolute()
+                                .left(px(metrics.track_start))
+                                .top(px(top))
+                                .w(px(metrics.track_length))
+                                .h(px(BOARD_SCROLLBAR_THICKNESS))
+                                .rounded_full()
+                                .bg(track_color)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        let position = f32::from(event.position.x) - origin_x;
+                                        this.jump_board_scroll(metrics, position, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .id("board-scrollbar-horizontal-thumb")
+                                        .absolute()
+                                        .left(px(metrics.thumb_offset))
+                                        .top(px(0.))
+                                        .w(px(metrics.thumb_length))
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(thumb_color)
+                                        .hover(move |style| style.bg(thumb_hover))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    let position =
+                                                        f32::from(event.position.x) - origin_x;
+                                                    this.start_board_scroll_drag(
+                                                        metrics, position, cx,
+                                                    );
+                                                },
+                                            ),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    bars
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let view = cx.entity();
         let canvas_element = canvas(
             |bounds, _, _| bounds,
             move |_, bounds, window, _cx| {
                 paint_grid(bounds, camera, border, window);
                 paint_edges(bounds, camera, &edges, edge_color, window);
+                paint_connection_edges(bounds, camera, &connection_edges, edge_color, window);
             },
         )
         .absolute()
@@ -2970,8 +4616,11 @@ impl WhiteboardApp {
             .bg(cx.theme().background)
             .track_focus(&self.board_focus)
             .on_prepaint(move |bounds, _, cx| {
-                view.update(cx, |this, _| {
-                    this.board_bounds = Some(bounds);
+                view.update(cx, |this, cx| {
+                    if this.board_bounds != Some(bounds) {
+                        this.board_bounds = Some(bounds);
+                        cx.notify();
+                    }
                 });
             })
             .on_mouse_down(MouseButton::Left, cx.listener(Self::board_mouse_down))
@@ -2983,6 +4632,7 @@ impl WhiteboardApp {
             .children(elements)
             .children(selection_box)
             .children(resize_handle)
+            .children(scrollbars)
             .into_any_element()
     }
 
@@ -3060,6 +4710,7 @@ impl WhiteboardApp {
                     self.tr("文本卡片", "Text card").to_string()
                 };
                 let header_height = (32.0 * zoom).clamp(18.0, 34.0);
+                let show_body = height > header_height + padding * 2.0 + font_size * 1.2;
                 let content = content.clone();
                 let format = *format;
                 let menu_kind = if is_note {
@@ -3161,6 +4812,64 @@ impl WhiteboardApp {
                                     .font_bold()
                                     .child(title),
                             )
+                            .when(node.locked, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px((20.0 * zoom).clamp(12.0, 24.0)))
+                                        .text_size(px((11.0 * zoom).clamp(7.0, 15.0)))
+                                        .child("🔒"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("card-height-{node_id}")))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px((20.0 * zoom).clamp(12.0, 24.0)))
+                                    .rounded(px(4.0))
+                                    .text_color(theme.primary)
+                                    .cursor_pointer()
+                                    .when(node.auto_height, |this| {
+                                        this.bg(theme.primary.opacity(0.15))
+                                    })
+                                    .hover(|style| style.bg(theme.primary.opacity(0.12)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.toggle_text_card_height(node_id, window, cx);
+                                    }))
+                                    .child(
+                                        Icon::new(IconName::ChevronsUpDown)
+                                            .size(px((12.0 * zoom).clamp(7.0, 16.0))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("card-ai-{node_id}")))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px((20.0 * zoom).clamp(12.0, 24.0)))
+                                    .rounded(px(4.0))
+                                    .text_color(theme.primary)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.primary.opacity(0.12)))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_ai_editor(node_id, window, cx);
+                                    }))
+                                    .child(
+                                        Icon::new(IconName::Bot)
+                                            .size(px((12.0 * zoom).clamp(7.0, 16.0))),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .text_size(px((10.0 * zoom).clamp(5.0, 14.)))
@@ -3176,7 +4885,9 @@ impl WhiteboardApp {
                             .overflow_hidden()
                             .p(px(padding))
                             .text_size(px(font_size))
-                            .child(render_text_content(node.id, content, format, zoom)),
+                            .when(show_body, |this| {
+                                this.child(render_text_content(node.id, content, format, zoom))
+                            }),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
@@ -3234,6 +4945,13 @@ impl WhiteboardApp {
                             .font_bold()
                             .child(title.clone()),
                     )
+                    .when(node.locked, |this| {
+                        this.child(
+                            div()
+                                .text_size(px((11.0 * zoom).clamp(7.0, 15.0)))
+                                .child("🔒"),
+                        )
+                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, _, _, cx| {
@@ -3251,6 +4969,16 @@ impl WhiteboardApp {
             }
             NodeKind::Image { path, .. } => {
                 let full_path = self.root.join(path);
+                let lock_badge = || {
+                    node.locked.then(|| {
+                        div()
+                            .absolute()
+                            .top(px((4.0 * zoom).clamp(2.0, 8.0)))
+                            .right(px((4.0 * zoom).clamp(2.0, 8.0)))
+                            .text_size(px((11.0 * zoom).clamp(7.0, 15.0)))
+                            .child("🔒")
+                    })
+                };
                 if rotated {
                     let key = rotated_svg_key(node, "", Some(path), None, &theme);
                     let image = self.cached_rotated_svg(key, || {
@@ -3260,6 +4988,7 @@ impl WhiteboardApp {
                         return base
                             .p(px(0.))
                             .child(img(image).w_full().h_full())
+                            .children(lock_badge())
                             .into_any_element();
                     }
                 }
@@ -3272,6 +5001,7 @@ impl WhiteboardApp {
                                 .h_full()
                                 .object_fit(ObjectFit::Contain),
                         )
+                        .children(lock_badge())
                         .into_any_element()
                 } else {
                     base.flex()
@@ -3280,6 +5010,7 @@ impl WhiteboardApp {
                         .text_color(theme.muted_foreground)
                         .text_size(px(font_size))
                         .child(self.tr("图片缺失", "Image missing"))
+                        .children(lock_badge())
                         .into_any_element()
                 }
             }
@@ -3290,10 +5021,10 @@ impl WhiteboardApp {
         let background = cx.theme().background;
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let popover = cx.theme().popover;
-        let popover_fg = cx.theme().popover_foreground;
         let primary = cx.theme().primary;
         let language = self.settings.language;
+        let popover = cx.theme().popover;
+        let popover_fg = cx.theme().popover_foreground;
         let dark = self.settings.theme.dark;
         let root_display = self.root.display().to_string();
 
@@ -3331,6 +5062,103 @@ impl WhiteboardApp {
                     })),
             )
             .into_any_element();
+
+        let live_preview = self.settings.live_preview;
+        let editor_body = h_flex()
+            .gap_2()
+            .child(
+                Button::new("live-preview-on")
+                    .label(self.tr("开启", "On"))
+                    .selected(live_preview)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_live_preview(true, cx);
+                    })),
+            )
+            .child(
+                Button::new("live-preview-off")
+                    .label(self.tr("关闭", "Off"))
+                    .selected(!live_preview)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_live_preview(false, cx);
+                    })),
+            )
+            .into_any_element();
+
+        let floating_scrollbars = self.settings.floating_scrollbars;
+        let scrollbar_body = h_flex()
+            .gap_2()
+            .child(
+                Button::new("floating-scrollbars-on")
+                    .label(self.tr("显示", "On"))
+                    .selected(floating_scrollbars)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_floating_scrollbars(true, cx);
+                    })),
+            )
+            .child(
+                Button::new("floating-scrollbars-off")
+                    .label(self.tr("隐藏", "Off"))
+                    .selected(!floating_scrollbars)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_floating_scrollbars(false, cx);
+                    })),
+            )
+            .into_any_element();
+
+        let ai_body =
+            v_flex()
+                .gap_3()
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child(
+                            self.tr("服务地址（OpenAI 兼容）", "Base URL (OpenAI compatible)"),
+                        ))
+                        .child(Input::new(&self.ai_base_input).w_full()),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_2()
+                                .child(div().text_sm().text_color(muted).child("API Key"))
+                                .child(Input::new(&self.ai_key_input).w_full()),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(self.tr("模型", "Model")),
+                                )
+                                .child(Input::new(&self.ai_model_input).w_full()),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child(self.tr(
+                            "图片生成模型（可选，用于 AI 文档配图）",
+                            "Image model (optional, used for AI document images)",
+                        )))
+                        .child(Input::new(&self.ai_image_model_input).w_full()),
+                )
+                .child(
+                    Button::new("save-ai-settings")
+                        .primary()
+                        .label(self.tr("保存 AI 设置", "Save AI settings"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.save_ai_settings(cx);
+                        })),
+                )
+                .into_any_element();
 
         let preset_buttons = THEME_PRESETS
             .iter()
@@ -3600,6 +5428,33 @@ impl WhiteboardApp {
                                         theme_body,
                                     ))
                                     .child(section(
+                                        self.tr("编辑器", "Editor").to_string(),
+                                        self.tr(
+                                            "编辑笔记或文本卡片时，左侧输入内容，右侧实时预览渲染效果。",
+                                            "When editing a note or text card, show the source on the left and a live rendered preview on the right.",
+                                        )
+                                        .to_string(),
+                                        editor_body,
+                                    ))
+                                    .child(section(
+                                        self.tr("画板", "Board").to_string(),
+                                        self.tr(
+                                            "控制画板右侧和底部的浮动滚动条，拖动滚动条可平移画板。",
+                                            "Show or hide the floating scrollbars on the right and bottom of the board. Drag them to pan the board.",
+                                        )
+                                        .to_string(),
+                                        scrollbar_body,
+                                    ))
+                                    .child(section(
+                                        self.tr("AI 服务商", "AI provider").to_string(),
+                                        self.tr(
+                                            "配置 OpenAI Chat Completions 兼容服务，用于文本卡片中的 AI 写作。",
+                                            "Configure an OpenAI Chat Completions compatible service for AI writing in text cards.",
+                                        )
+                                        .to_string(),
+                                        ai_body,
+                                    ))
+                                    .child(section(
                                         self.tr("笔记保存路径", "Notes storage").to_string(),
                                         self.tr(
                                             "所有笔记、白板数据和粘贴的图片都会保存在此目录。",
@@ -3689,6 +5544,282 @@ impl WhiteboardApp {
                     }),
             )
             .into_any_element()
+    }
+
+    fn render_ai_doc_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.ai_doc_dialog.is_none() {
+            return div().into_any_element();
+        }
+        let viewport = window.viewport_size();
+        let ai_doc_loading = self.ai_doc_loading;
+        let estimated_height = if ai_doc_loading {
+            470.0
+        } else {
+            self.ai_doc_input_height + 280.0
+        };
+        let max_x = (f32::from(viewport.width) - 560.0).max(8.0);
+        let max_y = (f32::from(viewport.height) - estimated_height).max(8.0);
+        let Some(dialog) = self.ai_doc_dialog.as_mut() else {
+            return div().into_any_element();
+        };
+        dialog.x = dialog.x.clamp(8.0, max_x);
+        dialog.y = dialog.y.clamp(8.0, max_y);
+        let include_images = dialog.include_images;
+        let dialog_x = dialog.x;
+        let dialog_y = dialog.y;
+        let overlay = cx.theme().overlay;
+        let popover = cx.theme().popover;
+        let popover_fg = cx.theme().popover_foreground;
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let primary = cx.theme().primary;
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(overlay)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_move(cx.listener(Self::ai_doc_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::finish_ai_doc_interactions),
+            )
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(Self::ai_doc_key_down))
+            .child(
+                v_flex()
+                    .absolute()
+                    .left(px(dialog_x))
+                    .top(px(dialog_y))
+                    .w(px(560.))
+                    .gap_4()
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(border)
+                    .bg(popover)
+                    .text_color(popover_fg)
+                    .shadow_lg()
+                    .p_5()
+                    .child(
+                        h_flex()
+                            .id("ai-doc-header")
+                            .gap_2()
+                            .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::start_ai_doc_drag),
+                            )
+                            .child(Icon::new(IconName::Bot).size(px(20.)).text_color(primary))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_bold()
+                                    .child(self.tr("AI 生成画板文档", "Generate board document")),
+                            )
+                            .child(div().flex_1())
+                            .child(div().text_xs().text_color(muted).child(
+                                self.tr("拖动标题栏移动", "Drag title to move"),
+                            )),
+                    )
+                    .when(!ai_doc_loading, |this| {
+                        this.child(div().text_sm().text_color(muted).child(self.tr(
+                            "AI 会把主题拆分为多张文本卡片，按需生成思维导图和配图，并自动创建节点连接。",
+                            "The AI splits the topic into text cards, adds a mind map and images when useful, and connects the nodes automatically.",
+                        )))
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(self.ai_doc_input_height))
+                                        .overflow_hidden()
+                                        .child(
+                                            Textarea::new(&self.ai_doc_input).w_full().h_full(),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("ai-doc-input-resize")
+                                        .flex()
+                                        .w_full()
+                                        .h(px(10.))
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_ns_resize()
+                                        .hover(|style| style.bg(muted.opacity(0.10)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::start_ai_doc_input_resize),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(44.))
+                                                .h(px(3.))
+                                                .rounded(px(2.))
+                                                .bg(muted.opacity(0.5)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(muted)
+                                                .child(self.tr("自动配图", "Generate images")),
+                                        )
+                                        .child(
+                                            Button::new("ai-doc-images-on")
+                                                .small()
+                                                .label(self.tr("开启", "On"))
+                                                .selected(include_images)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(dialog) = &mut this.ai_doc_dialog {
+                                                        dialog.include_images = true;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("ai-doc-images-off")
+                                                .small()
+                                                .label(self.tr("关闭", "Off"))
+                                                .selected(!include_images)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(dialog) = &mut this.ai_doc_dialog {
+                                                        dialog.include_images = false;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(self.tr(
+                                            "配图需要设置中的图片模型支持",
+                                            "Images use the image model configured in Settings",
+                                        )),
+                                ),
+                        )
+                    })
+                    .when(ai_doc_loading, |this| {
+                        this.child(div().text_sm().text_color(muted).child(self.tr(
+                            "AI 正在思考与规划。若模型支持 reasoning 字段，这里会实时显示思考内容；否则显示生成步骤。",
+                            "AI is thinking and planning. If the model exposes reasoning, it appears here live; otherwise generation stages are shown.",
+                        )))
+                        .child(
+                            div()
+                                .id("ai-doc-thinking")
+                                .w_full()
+                                .h(px(240.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(border)
+                                .bg(muted.opacity(0.06))
+                                .p_3()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .id("ai-doc-thinking-scroll")
+                                        .size_full()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.ai_doc_thinking_scroll)
+                                        .on_scroll_wheel(
+                                            cx.listener(Self::ai_doc_thinking_wheel),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .text_xs()
+                                                .whitespace_normal()
+                                                .child(if self.ai_doc_thinking.is_empty() {
+                                                    self.tr(
+                                                        "等待 AI 返回思考内容…",
+                                                        "Waiting for the AI reasoning...",
+                                                    )
+                                                    .to_string()
+                                                } else {
+                                                    self.ai_doc_thinking.clone()
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .when(ai_doc_loading, |this| {
+                                this.child(
+                                    Button::new("ai-doc-cancel-loading")
+                                        .ghost()
+                                        .icon(IconName::LoaderCircle)
+                                        .label(self.tr("取消生成", "Cancel generation"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.cancel_ai_document(window, cx);
+                                        })),
+                                )
+                            })
+                            .when(!ai_doc_loading, |this| {
+                                this.child(
+                                    Button::new("ai-doc-cancel")
+                                        .ghost()
+                                        .label(self.tr("取消", "Cancel"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.ai_doc_dialog = None;
+                                            this.board_focus.focus(window, cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("ai-doc-confirm")
+                                        .primary()
+                                        .icon(IconName::Bot)
+                                        .label(self.tr("生成文档", "Generate"))
+                                        .tooltip(self.tr(
+                                            "生成文档（Ctrl+Enter）",
+                                            "Generate (Ctrl+Enter)",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.generate_ai_document(window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn ai_doc_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            if self.ai_doc_loading {
+                self.cancel_ai_document(window, cx);
+            } else {
+                self.ai_doc_dialog = None;
+                self.board_focus.focus(window, cx);
+                cx.notify();
+            }
+        } else if event.keystroke.key == "enter"
+            && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && !self.ai_doc_loading
+        {
+            self.generate_ai_document(window, cx);
+        }
     }
 
     fn render_create_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -4074,6 +6205,17 @@ impl WhiteboardApp {
         };
 
         let show_format = matches!(editor.target, EditTarget::Text(_));
+        let live_preview = is_body && self.settings.live_preview;
+        let preview_content = if live_preview {
+            self.body_input.read(cx).value().to_string()
+        } else {
+            String::new()
+        };
+        let text_style = window.text_style();
+        let preview_font_size = text_style.font_size.to_pixels(window.rem_size());
+        let preview_line_height = text_style.line_height_in_pixels(window.rem_size());
+        let preview_line_height_ratio =
+            f32::from(preview_line_height) / f32::from(preview_font_size).max(1.0);
         let viewport = window.viewport_size();
         let max_width = (f32::from(viewport.width) - 40.0).max(480.0);
         let max_height = (f32::from(viewport.height) - 40.0).max(320.0);
@@ -4091,9 +6233,8 @@ impl WhiteboardApp {
             .justify_center()
             .bg(overlay)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_move(cx.listener(Self::editor_resize_move))
+            .on_mouse_move(cx.listener(Self::editor_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_editor_resize))
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_key_down(cx.listener(Self::editor_key_down))
             .child(
                 v_flex()
@@ -4109,6 +6250,7 @@ impl WhiteboardApp {
                     .text_color(popover_fg)
                     .shadow_lg()
                     .p_5()
+                    .overflow_hidden()
                     .child(
                         h_flex()
                             .gap_2()
@@ -4125,6 +6267,31 @@ impl WhiteboardApp {
                             .child(div().flex_1().text_lg().font_bold().child(title))
                             .when(show_format, |this| {
                                 this.child(
+                                    Button::new("toggle-ai-writing")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::Bot)
+                                        .tooltip(self.tr("AI 写作", "AI writing"))
+                                        .selected(editor.ai_open)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let open = if let Some(editor) = &mut this.editor {
+                                                editor.ai_open = !editor.ai_open;
+                                                editor.ai_open
+                                            } else {
+                                                false
+                                            };
+                                            if open {
+                                                let input = this.ai_input.clone();
+                                                window.defer(cx, move |window, cx| {
+                                                    input.update(cx, |state, cx| {
+                                                        state.focus(window, cx);
+                                                    });
+                                                });
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
                                     Button::new("edit-format-md")
                                         .small()
                                         .label("Markdown")
@@ -4148,17 +6315,233 @@ impl WhiteboardApp {
                                             cx.notify();
                                         })),
                                 )
+                            })
+                            .when(matches!(editor.target, EditTarget::Note), |this| {
+                                this.child(
+                                    Button::new("toggle-ai-writing-note")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::Bot)
+                                        .tooltip(self.tr("AI 写作", "AI writing"))
+                                        .selected(editor.ai_open)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let open = if let Some(editor) = &mut this.editor {
+                                                editor.ai_open = !editor.ai_open;
+                                                editor.ai_open
+                                            } else {
+                                                false
+                                            };
+                                            if open {
+                                                let input = this.ai_input.clone();
+                                                window.defer(cx, move |window, cx| {
+                                                    input.update(cx, |state, cx| {
+                                                        state.focus(window, cx);
+                                                    });
+                                                });
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
                             }),
                     )
                     .child(div().text_sm().text_color(muted).child(hint))
-                    .child(if is_body {
+                    .child(if live_preview {
+                        h_flex()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(
+                                        Textarea::new(&self.body_input)
+                                            .w_full()
+                                            .h_full()
+                                            .min_h_0()
+                                            .overflow_hidden(),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .rounded(px(8.))
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(cx.theme().background)
+                                    .overflow_hidden()
+                                    .child(
+                                        h_flex()
+                                            .h(px(30.))
+                                            .px_3()
+                                            .border_b_1()
+                                            .border_color(border)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(self.tr("实时预览", "Live preview")),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .id("editor-preview-scroll")
+                                                    .size_full()
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&self.preview_scroll)
+                                                    .on_scroll_wheel(
+                                                        cx.listener(Self::preview_scroll_wheel),
+                                                    )
+                                                    .p_4()
+                                                    .text_size(preview_font_size)
+                                                    .line_height(relative(
+                                                        preview_line_height_ratio,
+                                                    ))
+                                                    .child(render_editor_preview_content(
+                                                        preview_content.clone(),
+                                                        editor.format,
+                                                        preview_font_size,
+                                                        preview_line_height,
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .right_0()
+                                                    .bottom_0()
+                                                    .w(Scrollbar::width())
+                                                    .child(Scrollbar::vertical(
+                                                        &self.preview_scroll,
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .into_any_element()
+                    } else if is_body {
                         Textarea::new(&self.body_input)
                             .w_full()
                             .flex_1()
                             .min_h_0()
+                            .overflow_hidden()
                             .into_any_element()
                     } else {
                         Input::new(&self.title_input).w_full().into_any_element()
+                    })
+                    .when(is_body && editor.ai_open, |this| {
+                        this.child(
+                            v_flex()
+                                .w_full()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            Icon::new(IconName::Bot)
+                                                .size(px(16.))
+                                                .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .h(px(self.ai_input_height))
+                                                .child(
+                                                    Textarea::new(&self.ai_input).w_full().h_full(),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new("ai-send")
+                                                .primary()
+                                                .small()
+                                                .icon(if self.ai_loading {
+                                                    IconName::LoaderCircle
+                                                } else {
+                                                    IconName::ArrowUp
+                                                })
+                                                .label(if self.ai_loading {
+                                                    self.tr("生成中", "Generating")
+                                                } else {
+                                                    self.tr("发送", "Send")
+                                                })
+                                                .disabled(self.ai_loading)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.send_ai_prompt(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new("ai-height-up")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::ChevronUp)
+                                                        .tooltip(self.tr(
+                                                            "加高 AI 输入框",
+                                                            "Make the AI input taller",
+                                                        ))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.ai_input_height =
+                                                                (this.ai_input_height + 24.0)
+                                                                    .min(260.0);
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("ai-height-down")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::ChevronDown)
+                                                        .tooltip(self.tr(
+                                                            "降低 AI 输入框",
+                                                            "Make the AI input shorter",
+                                                        ))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.ai_input_height =
+                                                                (this.ai_input_height - 24.0)
+                                                                    .max(40.0);
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("ai-input-resize")
+                                        .flex()
+                                        .w_full()
+                                        .h(px(10.))
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_ns_resize()
+                                        .hover(|style| style.bg(muted.opacity(0.10)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::start_ai_input_resize),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(44.))
+                                                .h(px(3.))
+                                                .rounded(px(2.))
+                                                .bg(muted.opacity(0.5)),
+                                        ),
+                                ),
+                        )
                     })
                     .child(
                         h_flex()
@@ -4239,6 +6622,10 @@ impl Render for WhiteboardApp {
             .delete_dialog
             .is_some()
             .then(|| self.render_delete_dialog(window, cx));
+        let ai_doc_dialog = self
+            .ai_doc_dialog
+            .is_some()
+            .then(|| self.render_ai_doc_dialog(window, cx));
 
         let split = if let Some(sidebar) = sidebar {
             h_resizable(SharedString::from(format!(
@@ -4266,6 +6653,7 @@ impl Render for WhiteboardApp {
             .children(editor_dialog)
             .children(rename_dialog)
             .children(delete_dialog)
+            .children(ai_doc_dialog)
     }
 }
 
@@ -4567,8 +6955,20 @@ fn node_context_menu(
     kind: NodeMenuKind,
     language: Language,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-    move |menu, window, _cx| {
+    move |menu, window, cx| {
         let mut menu = menu;
+        let has_connections = view.read(cx).note.as_ref().is_some_and(|note| {
+            note.board
+                .connections
+                .iter()
+                .any(|connection| connection.from == node_id || connection.to == node_id)
+        });
+        let locked = view
+            .read(cx)
+            .note
+            .as_ref()
+            .and_then(|note| note.board.node(node_id))
+            .is_some_and(|node| node.locked);
 
         if !matches!(kind, NodeMenuKind::Image) {
             let edit_view = view.clone();
@@ -4578,6 +6978,42 @@ fn node_context_menu(
                     .on_click(window.listener_for(&edit_view, move |this, _, window, cx| {
                         this.open_editor_for_node(node_id, window, cx);
                     })),
+            );
+        }
+
+        let lock_view = view.clone();
+        menu = menu.item(
+            PopupMenuItem::new(if locked {
+                language.pick("解锁卡片", "Unlock card")
+            } else {
+                language.pick("锁定卡片", "Lock card")
+            })
+            .icon(IconName::Ban)
+            .on_click(window.listener_for(&lock_view, move |this, _, _, cx| {
+                this.select_node_from_pointer(node_id);
+                this.toggle_node_lock(node_id, cx);
+            })),
+        );
+
+        if matches!(kind, NodeMenuKind::Note | NodeMenuKind::Text(_)) {
+            let connect_view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(language.pick("连接到文本节点", "Connect to text node"))
+                    .icon(IconName::Network)
+                    .on_click(window.listener_for(&connect_view, move |this, _, _, cx| {
+                        this.begin_connection_from(node_id, cx);
+                    })),
+            );
+            let disconnect_view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(language.pick("删除所有连接", "Remove all connections"))
+                    .icon(IconName::Network)
+                    .disabled(!has_connections)
+                    .on_click(
+                        window.listener_for(&disconnect_view, move |this, _, _, cx| {
+                            this.remove_node_connections(node_id, cx);
+                        }),
+                    ),
             );
         }
 
@@ -4645,13 +7081,16 @@ fn node_context_menu(
         if !matches!(kind, NodeMenuKind::Image) {
             menu = menu.separator();
         }
-        let can_delete = !matches!(kind, NodeMenuKind::Note);
+        let can_delete = !locked;
         let delete_view = view.clone();
         menu.item(
             PopupMenuItem::new(if can_delete {
-                language.pick("删除节点", "Delete node")
+                language.pick("删除卡片", "Delete card")
             } else {
-                language.pick("笔记主卡片不能删除", "The main note card cannot be deleted")
+                language.pick(
+                    "卡片已锁定，无法删除",
+                    "Card is locked and cannot be deleted",
+                )
             })
             .icon(IconName::Trash)
             .disabled(!can_delete)
@@ -4806,6 +7245,207 @@ fn remap_path(path: &Path, old: &Path, new: &Path) -> PathBuf {
     }
 }
 
+fn board_scrollbar_metrics(
+    camera: Camera,
+    nodes: &[BoardNode],
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (Option<BoardScrollbarMetrics>, Option<BoardScrollbarMetrics>) {
+    if nodes.is_empty() || viewport_width <= 1.0 || viewport_height <= 1.0 {
+        return (None, None);
+    }
+
+    let min_x = nodes
+        .iter()
+        .map(|node| node.x)
+        .fold(f32::INFINITY, f32::min);
+    let min_y = nodes
+        .iter()
+        .map(|node| node.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = nodes
+        .iter()
+        .map(|node| node.x + node.w)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = nodes
+        .iter()
+        .map(|node| node.y + node.h)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let zoom = camera.zoom.max(0.01);
+    let content_width = ((max_x - min_x) * zoom).max(1.0);
+    let content_height = ((max_y - min_y) * zoom).max(1.0);
+    let show_vertical = content_height > viewport_height + 0.5;
+    let show_horizontal = content_width > viewport_width + 0.5;
+
+    let vertical_track_length = (viewport_height
+        - BOARD_SCROLLBAR_INSET * 2.0
+        - if show_horizontal {
+            BOARD_SCROLLBAR_THICKNESS + BOARD_SCROLLBAR_GAP
+        } else {
+            0.0
+        })
+    .max(0.0);
+    let horizontal_track_length = (viewport_width
+        - BOARD_SCROLLBAR_INSET * 2.0
+        - if show_vertical {
+            BOARD_SCROLLBAR_THICKNESS + BOARD_SCROLLBAR_GAP
+        } else {
+            0.0
+        })
+    .max(0.0);
+
+    let vertical = show_vertical.then(|| {
+        let scroll_span = content_height - viewport_height;
+        let thumb_length = (vertical_track_length * viewport_height / content_height).clamp(
+            BOARD_SCROLLBAR_MIN_THUMB.min(vertical_track_length),
+            vertical_track_length,
+        );
+        let thumb_range = (vertical_track_length - thumb_length).max(0.0);
+        let pan_max = -min_y * zoom;
+        let pan_min = viewport_height - max_y * zoom;
+        let progress = ((pan_max - camera.pan_y) / scroll_span).clamp(0.0, 1.0);
+        BoardScrollbarMetrics {
+            axis: BoardScrollAxis::Vertical,
+            track_start: BOARD_SCROLLBAR_INSET,
+            track_length: vertical_track_length,
+            thumb_offset: progress * thumb_range,
+            thumb_length,
+            scroll_span,
+            thumb_range,
+            pan_min,
+            pan_max,
+        }
+    });
+
+    let horizontal = show_horizontal.then(|| {
+        let scroll_span = content_width - viewport_width;
+        let thumb_length = (horizontal_track_length * viewport_width / content_width).clamp(
+            BOARD_SCROLLBAR_MIN_THUMB.min(horizontal_track_length),
+            horizontal_track_length,
+        );
+        let thumb_range = (horizontal_track_length - thumb_length).max(0.0);
+        let pan_max = -min_x * zoom;
+        let pan_min = viewport_width - max_x * zoom;
+        let progress = ((pan_max - camera.pan_x) / scroll_span).clamp(0.0, 1.0);
+        BoardScrollbarMetrics {
+            axis: BoardScrollAxis::Horizontal,
+            track_start: BOARD_SCROLLBAR_INSET,
+            track_length: horizontal_track_length,
+            thumb_offset: progress * thumb_range,
+            thumb_length,
+            scroll_span,
+            thumb_range,
+            pan_min,
+            pan_max,
+        }
+    });
+
+    (vertical, horizontal)
+}
+
+fn auto_connect_generated_nodes(
+    connections: &mut Vec<NodeConnection>,
+    text_ids: &[Uuid],
+    mind_root: Option<Uuid>,
+) {
+    for pair in text_ids.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        if from != to
+            && !connections
+                .iter()
+                .any(|existing| existing.from == from && existing.to == to)
+        {
+            connections.push(NodeConnection::new(from, to));
+        }
+    }
+    if let (Some(from), Some(to)) = (text_ids.last().copied(), mind_root)
+        && from != to
+        && !connections
+            .iter()
+            .any(|existing| existing.from == from && existing.to == to)
+    {
+        connections.push(NodeConnection::new(from, to));
+    }
+}
+
+struct AiMindDraft {
+    plan_id: String,
+    node: BoardNode,
+    parent_plan: Option<String>,
+}
+
+fn ai_mind_children(drafts: &[AiMindDraft]) -> (HashMap<String, Vec<usize>>, Vec<usize>) {
+    let mut ids = HashMap::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        ids.insert(draft.plan_id.as_str(), index);
+    }
+    let mut children: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut roots = Vec::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        if let Some(parent) = draft.parent_plan.as_deref()
+            && ids.contains_key(parent)
+        {
+            children.entry(parent.to_string()).or_default().push(index);
+        } else {
+            roots.push(index);
+        }
+    }
+    (children, roots)
+}
+
+fn ai_mind_subtree_height(
+    drafts: &[AiMindDraft],
+    index: usize,
+    children: &HashMap<String, Vec<usize>>,
+    memo: &mut HashMap<usize, f32>,
+) -> f32 {
+    if let Some(height) = memo.get(&index) {
+        return *height;
+    }
+    let own_height = drafts[index].node.h;
+    let mut height = own_height;
+    if let Some(list) = children.get(&drafts[index].plan_id)
+        && !list.is_empty()
+    {
+        let mut total = 0.0;
+        for (position, child) in list.iter().enumerate() {
+            if position > 0 {
+                total += 40.0;
+            }
+            total += ai_mind_subtree_height(drafts, *child, children, memo);
+        }
+        height = height.max(total);
+    }
+    memo.insert(index, height);
+    height
+}
+
+fn ai_layout_mind_subtree(
+    drafts: &mut [AiMindDraft],
+    index: usize,
+    depth: usize,
+    top: f32,
+    base_x: f32,
+    children: &HashMap<String, Vec<usize>>,
+    memo: &mut HashMap<usize, f32>,
+) {
+    let height = ai_mind_subtree_height(drafts, index, children, memo);
+    drafts[index].node.x = base_x + depth as f32 * 300.0;
+    drafts[index].node.y = top + (height - drafts[index].node.h) / 2.0;
+    let Some(list) = children.get(&drafts[index].plan_id) else {
+        return;
+    };
+    let mut child_top = top;
+    for (position, child) in list.iter().enumerate() {
+        if position > 0 {
+            child_top += 40.0;
+        }
+        let child_height = ai_mind_subtree_height(drafts, *child, children, memo);
+        ai_layout_mind_subtree(drafts, *child, depth + 1, child_top, base_x, children, memo);
+        child_top += child_height;
+    }
+}
+
 fn fit_image(width: f32, height: f32) -> (f32, f32) {
     let max_width = 520.0;
     let max_height = 420.0;
@@ -4813,6 +7453,49 @@ fn fit_image(width: f32, height: f32) -> (f32, f32) {
         .min(max_height / height.max(1.0))
         .min(1.0);
     ((width * scale).max(80.0), (height * scale).max(60.0))
+}
+
+fn render_editor_preview_content(
+    content: String,
+    format: TextFormat,
+    font_size: Pixels,
+    line_height: Pixels,
+) -> AnyElement {
+    match format {
+        TextFormat::Markdown => TextView::markdown(SharedString::from("editor-preview"), content)
+            .selectable(false)
+            .w_full()
+            .min_w_0()
+            .into_any_element(),
+        TextFormat::Plain => {
+            let lines = if content.is_empty() {
+                vec![" ".to_string()]
+            } else {
+                content
+                    .lines()
+                    .map(|line| {
+                        if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect()
+            };
+
+            v_flex()
+                .w_full()
+                .gap_0()
+                .children(lines.into_iter().map(|line| {
+                    div()
+                        .w_full()
+                        .min_h(line_height)
+                        .text_size(font_size)
+                        .child(line)
+                }))
+                .into_any_element()
+        }
+    }
 }
 
 fn render_text_content(
@@ -4826,7 +7509,10 @@ fn render_text_content(
             TextView::markdown(SharedString::from(format!("markdown-{node_id}")), content)
                 .selectable(false)
                 .w_full()
+                .h_full()
                 .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
                 .into_any_element()
         }
         TextFormat::Plain => {
@@ -4849,7 +7535,10 @@ fn render_text_content(
 
             v_flex()
                 .w_full()
+                .h_full()
+                .min_h_0()
                 .gap_0()
+                .overflow_hidden()
                 .children(lines.into_iter().map(|line| {
                     div()
                         .w_full()
@@ -4860,6 +7549,45 @@ fn render_text_content(
                 .into_any_element()
         }
     }
+}
+
+fn measure_text_card_height(
+    node: &BoardNode,
+    content: &str,
+    window: &Window,
+    font_family: &SharedString,
+) -> f32 {
+    let wrap_width = (node.w - 24.0).max(40.0);
+    let run = TextRun {
+        len: content.len(),
+        font: font(font_family.clone()),
+        color: Hsla::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line_count = window
+        .text_system()
+        .shape_text(
+            SharedString::from(content.to_string()),
+            px(13.0),
+            &[run],
+            Some(px(wrap_width)),
+            None,
+        )
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| line.wrap_boundaries().len() + 1)
+                .sum::<usize>()
+        })
+        .unwrap_or_else(|_| content.lines().count().max(1))
+        .max(1);
+    let headings = content
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .count() as f32;
+    (line_count as f32 * 20.0 + 52.0 + headings * 6.0).max(210.0)
 }
 
 fn measured_mind_lines(
@@ -4920,6 +7648,76 @@ fn fit_mind_node_heights(
     changed
 }
 
+fn fit_auto_text_heights(
+    nodes: &mut [BoardNode],
+    window: &Window,
+    font_family: &SharedString,
+) -> bool {
+    let mut changed = false;
+    for node in nodes
+        .iter_mut()
+        .filter(|node| node.auto_height && (node.kind.is_text() || node.kind.is_note()))
+    {
+        let content = match &node.kind {
+            NodeKind::Text { content, .. } | NodeKind::Note { content, .. } => content,
+            _ => continue,
+        };
+        let height = measure_text_card_height(node, content, window, font_family);
+        if (node.h - height).abs() > 0.5 {
+            node.h = height;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn scroll_editor_to_bottom(state: &mut TextareaState, cx: &mut Context<TextareaState>) {
+    let total_lines = state.value().lines().count().max(1);
+    let visible_rows = state
+        .visible_row_range()
+        .map(|range| range.len())
+        .unwrap_or(1)
+        .max(1);
+    let line_height = state.line_height().map(f32::from).unwrap_or(20.0);
+    let target = -((total_lines.saturating_sub(visible_rows)) as f32 * line_height);
+    state.set_scroll_offset(point(px(0.), px(target)), cx);
+}
+
+fn append_ai_content(existing: &str, generated: &str) -> String {
+    if generated.is_empty() {
+        return existing.to_string();
+    }
+    if existing.trim().is_empty() {
+        return generated.to_string();
+    }
+    let mut result = existing.trim_end().to_string();
+    if result.ends_with('\n') {
+        result.push('\n');
+    } else {
+        result.push_str("\n\n");
+    }
+    result.push_str(generated.trim_start_matches('\n'));
+    result
+}
+
+fn preview_scroll_ratio(
+    offset_y: f32,
+    line_height: f32,
+    total_lines: usize,
+    visible_rows: usize,
+) -> f32 {
+    let max_editor_scroll = total_lines.saturating_sub(visible_rows) as f32 * line_height;
+    if max_editor_scroll <= 0.0 {
+        0.0
+    } else {
+        (-offset_y / max_editor_scroll).clamp(0.0, 1.0)
+    }
+}
+
+fn is_connectable_node(node: &BoardNode) -> bool {
+    matches!(node.kind, NodeKind::Note { .. } | NodeKind::Text { .. })
+}
+
 fn window_control_button(
     id: &'static str,
     area: WindowControlArea,
@@ -4973,6 +7771,87 @@ fn paint_grid(viewport: Bounds<Pixels>, camera: Camera, color: Hsla, window: &mu
     }
 }
 
+fn connection_anchors(from: &BoardNode, to: &BoardNode) -> ((f32, f32), (f32, f32)) {
+    let from_center = (from.x + from.w / 2.0, from.y + from.h / 2.0);
+    let to_center = (to.x + to.w / 2.0, to.y + to.h / 2.0);
+    (
+        node_edge_point(from, to_center.0, to_center.1),
+        node_edge_point(to, from_center.0, from_center.1),
+    )
+}
+
+fn node_edge_point(node: &BoardNode, toward_x: f32, toward_y: f32) -> (f32, f32) {
+    let center_x = node.x + node.w / 2.0;
+    let center_y = node.y + node.h / 2.0;
+    let dx = toward_x - center_x;
+    let dy = toward_y - center_y;
+    if dx.abs() < 0.01 && dy.abs() < 0.01 {
+        return (center_x, center_y);
+    }
+
+    let tx = if dx.abs() < 0.01 {
+        f32::INFINITY
+    } else if dx > 0.0 {
+        (node.x + node.w - center_x) / dx
+    } else {
+        (node.x - center_x) / dx
+    };
+    let ty = if dy.abs() < 0.01 {
+        f32::INFINITY
+    } else if dy > 0.0 {
+        (node.y + node.h - center_y) / dy
+    } else {
+        (node.y - center_y) / dy
+    };
+    let scale = tx.min(ty).max(0.0);
+    (center_x + dx * scale, center_y + dy * scale)
+}
+
+fn paint_connection_edges(
+    viewport: Bounds<Pixels>,
+    camera: Camera,
+    edges: &[(f32, f32, f32, f32)],
+    color: Hsla,
+    window: &mut Window,
+) {
+    let stroke = px((2.0 * camera.zoom).clamp(1.2, 3.0));
+    let arrow_length = (11.0 * camera.zoom).clamp(5.0, 14.0);
+
+    for (start_x, start_y, end_x, end_y) in edges {
+        let (sx, sy) = camera.world_to_screen(*start_x, *start_y);
+        let (ex, ey) = camera.world_to_screen(*end_x, *end_y);
+        let start = point(viewport.origin.x + px(sx), viewport.origin.y + px(sy));
+        let end = point(viewport.origin.x + px(ex), viewport.origin.y + px(ey));
+
+        let mut path = PathBuilder::stroke(stroke);
+        path.move_to(start);
+        path.line_to(end);
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
+
+        let dx = f32::from(end.x - start.x);
+        let dy = f32::from(end.y - start.y);
+        let angle = dy.atan2(dx);
+        let left = point(
+            end.x - px(arrow_length * (angle - 0.45).cos()),
+            end.y - px(arrow_length * (angle - 0.45).sin()),
+        );
+        let right = point(
+            end.x - px(arrow_length * (angle + 0.45).cos()),
+            end.y - px(arrow_length * (angle + 0.45).sin()),
+        );
+        let mut head = PathBuilder::fill();
+        head.move_to(end);
+        head.line_to(left);
+        head.line_to(right);
+        head.close();
+        if let Ok(head) = head.build() {
+            window.paint_path(head, color);
+        }
+    }
+}
+
 fn paint_edges(
     viewport: Bounds<Pixels>,
     camera: Camera,
@@ -5019,6 +7898,104 @@ mod tests {
         assert!(ids.contains(&child_id));
         assert!(ids.contains(&grandchild_id));
         assert!(!ids.contains(&other_id));
+    }
+
+    #[::core::prelude::v1::test]
+    fn ai_generation_appends_without_overwriting_existing_content() {
+        assert_eq!(append_ai_content("", "new"), "new");
+        assert_eq!(append_ai_content("old", "new"), "old\n\nnew");
+        assert_eq!(append_ai_content("old\n", "new"), "old\n\nnew");
+        assert_eq!(append_ai_content("old", "\nnew"), "old\n\nnew");
+    }
+
+    #[::core::prelude::v1::test]
+    fn preview_scroll_ratio_tracks_the_editor_scroll_range() {
+        assert_eq!(preview_scroll_ratio(0.0, 20.0, 100, 10), 0.0);
+        assert!((preview_scroll_ratio(-900.0, 20.0, 100, 10) - 0.5).abs() < 0.001);
+        assert_eq!(preview_scroll_ratio(-2000.0, 20.0, 100, 10), 1.0);
+        assert_eq!(preview_scroll_ratio(-100.0, 20.0, 5, 10), 0.0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn board_scrollbars_only_appear_when_content_exceeds_viewport() {
+        let camera = Camera {
+            pan_x: 48.0,
+            pan_y: 48.0,
+            zoom: 1.0,
+        };
+        let nodes = vec![BoardNode::text(0.0, 0.0, "hello", TextFormat::Plain)];
+
+        let (vertical, horizontal) = board_scrollbar_metrics(camera, &nodes, 2000.0, 2000.0);
+        assert!(vertical.is_none());
+        assert!(horizontal.is_none());
+
+        let (vertical, horizontal) = board_scrollbar_metrics(camera, &nodes, 300.0, 150.0);
+        let vertical = vertical.expect("vertical scrollbar should be visible");
+        let horizontal = horizontal.expect("horizontal scrollbar should be visible");
+        assert!((vertical.scroll_span - 60.0).abs() < 0.001);
+        assert!((horizontal.scroll_span - 40.0).abs() < 0.001);
+        assert!(vertical.thumb_offset.abs() < 0.001);
+        assert!(horizontal.thumb_offset.abs() < 0.001);
+        assert!(vertical.pan_max > vertical.pan_min);
+        assert!(horizontal.pan_max > horizontal.pan_min);
+
+        let scrolled = Camera {
+            pan_x: -40.0,
+            pan_y: -60.0,
+            zoom: 1.0,
+        };
+        let (vertical, horizontal) = board_scrollbar_metrics(scrolled, &nodes, 300.0, 150.0);
+        let vertical = vertical.expect("vertical scrollbar should be visible");
+        let horizontal = horizontal.expect("horizontal scrollbar should be visible");
+        assert!((vertical.thumb_offset - vertical.thumb_range).abs() < 0.001);
+        assert!((horizontal.thumb_offset - horizontal.thumb_range).abs() < 0.001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn generated_nodes_get_fallback_connections_without_duplicates() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let root = Uuid::new_v4();
+        let mut connections = Vec::new();
+        auto_connect_generated_nodes(&mut connections, &[a, b], Some(root));
+        assert_eq!(connections.len(), 2);
+        assert!(connections.iter().any(|c| c.from == a && c.to == b));
+        assert!(connections.iter().any(|c| c.from == b && c.to == root));
+        auto_connect_generated_nodes(&mut connections, &[a, b], Some(root));
+        assert_eq!(connections.len(), 2);
+    }
+
+    #[::core::prelude::v1::test]
+    fn ai_mind_layout_places_children_to_the_right_and_stacks_siblings() {
+        let root = BoardNode::mind(0.0, 0.0, "Root", None);
+        let child_a = BoardNode::mind(0.0, 0.0, "Child A", None);
+        let child_b = BoardNode::mind(0.0, 0.0, "Child B", None);
+        let mut drafts = vec![
+            AiMindDraft {
+                plan_id: "root".to_string(),
+                node: root,
+                parent_plan: None,
+            },
+            AiMindDraft {
+                plan_id: "a".to_string(),
+                node: child_a,
+                parent_plan: Some("root".to_string()),
+            },
+            AiMindDraft {
+                plan_id: "b".to_string(),
+                node: child_b,
+                parent_plan: Some("root".to_string()),
+            },
+        ];
+        let (children, roots) = ai_mind_children(&drafts);
+        assert_eq!(roots, vec![0]);
+        let mut memo = HashMap::new();
+        let height = ai_mind_subtree_height(&drafts, 0, &children, &mut memo);
+        ai_layout_mind_subtree(&mut drafts, 0, 0, 10.0, 100.0, &children, &mut memo);
+        assert!(height >= drafts[0].node.h);
+        assert!(drafts[1].node.x > drafts[0].node.x);
+        assert!(drafts[2].node.x > drafts[0].node.x);
+        assert!(drafts[1].node.y < drafts[2].node.y);
     }
 
     #[::core::prelude::v1::test]

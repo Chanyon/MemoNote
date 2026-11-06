@@ -46,6 +46,45 @@ pub struct ThemeSettings {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AiSettings {
+    #[serde(default = "default_ai_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    #[serde(default = "default_ai_image_model")]
+    pub image_model: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_ai_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_ai_image_model() -> String {
+    "dall-e-3".to_string()
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            base_url: default_ai_base_url(),
+            api_key: String::new(),
+            model: default_ai_model(),
+            image_model: default_ai_image_model(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
     pub language: Language,
@@ -53,6 +92,12 @@ pub struct AppSettings {
     pub theme: ThemeSettings,
     #[serde(default)]
     pub notes_root: Option<PathBuf>,
+    #[serde(default)]
+    pub live_preview: bool,
+    #[serde(default = "default_true")]
+    pub floating_scrollbars: bool,
+    #[serde(default)]
+    pub ai: AiSettings,
 }
 
 impl Default for AppSettings {
@@ -61,6 +106,9 @@ impl Default for AppSettings {
             language: Language::Zh,
             theme: ThemeSettings::default(),
             notes_root: None,
+            live_preview: false,
+            floating_scrollbars: true,
+            ai: AiSettings::default(),
         }
     }
 }
@@ -429,5 +477,68 @@ pub fn path_is_usable(path: &Path) -> bool {
         path.is_dir()
     } else {
         fs::create_dir_all(path).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_preview_defaults_to_off_for_old_settings() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("settings should load");
+        assert!(!settings.live_preview);
+    }
+
+    #[test]
+    fn live_preview_setting_round_trips() {
+        let settings = AppSettings {
+            live_preview: true,
+            ..Default::default()
+        };
+        let source = serde_json::to_string(&settings).expect("settings should serialize");
+        let restored: AppSettings = serde_json::from_str(&source).expect("settings should load");
+        assert!(restored.live_preview);
+    }
+
+    #[test]
+    fn floating_scrollbars_default_to_on_for_old_settings() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("settings should load");
+        assert!(settings.floating_scrollbars);
+    }
+
+    #[test]
+    fn floating_scrollbars_setting_round_trips() {
+        let settings = AppSettings {
+            floating_scrollbars: false,
+            ..Default::default()
+        };
+        let source = serde_json::to_string(&settings).expect("settings should serialize");
+        let restored: AppSettings = serde_json::from_str(&source).expect("settings should load");
+        assert!(!restored.floating_scrollbars);
+    }
+
+    #[test]
+    fn ai_settings_default_and_round_trip() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("settings should load");
+        assert_eq!(settings.ai.base_url, "https://api.openai.com/v1");
+        assert_eq!(settings.ai.model, "gpt-4o-mini");
+        assert_eq!(settings.ai.image_model, "dall-e-3");
+        assert!(settings.ai.api_key.is_empty());
+
+        let settings = AppSettings {
+            ai: AiSettings {
+                base_url: "http://localhost:11434/v1".to_string(),
+                api_key: "test-key".to_string(),
+                model: "local-model".to_string(),
+                image_model: "local-image".to_string(),
+            },
+            ..Default::default()
+        };
+        let source = serde_json::to_string(&settings).expect("settings should serialize");
+        let restored: AppSettings = serde_json::from_str(&source).expect("settings should load");
+        assert_eq!(restored.ai.base_url, "http://localhost:11434/v1");
+        assert_eq!(restored.ai.model, "local-model");
+        assert_eq!(restored.ai.image_model, "local-image");
     }
 }
