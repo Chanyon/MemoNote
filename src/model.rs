@@ -809,6 +809,68 @@ pub fn save_generated_image(root: &Path, bytes: &[u8]) -> Result<(PathBuf, f32, 
     Ok((path, width as f32, height as f32))
 }
 
+pub fn save_generated_svg(root: &Path, svg: &str) -> Result<(PathBuf, f32, f32)> {
+    let svg = svg.trim();
+    if !svg.to_ascii_lowercase().starts_with("<svg") {
+        return Err(anyhow!("generated SVG is missing the <svg> root element"));
+    }
+    let (width, height) = svg_dimensions(svg).unwrap_or((800.0, 600.0));
+
+    let assets = root.join(".assets");
+    fs::create_dir_all(&assets)
+        .with_context(|| format!("failed to create assets folder: {}", assets.display()))?;
+    let path = assets.join(format!("ai-{}.svg", Uuid::new_v4()));
+    fs::write(&path, svg.as_bytes())
+        .with_context(|| format!("failed to save generated SVG: {}", path.display()))?;
+
+    Ok((path, width, height))
+}
+
+fn svg_dimensions(svg: &str) -> Option<(f32, f32)> {
+    let width = svg_attribute(svg, "width").and_then(parse_svg_length);
+    let height = svg_attribute(svg, "height").and_then(parse_svg_length);
+    if let (Some(width), Some(height)) = (width, height) {
+        return Some((width, height));
+    }
+
+    let view_box = svg_attribute(svg, "viewBox").or_else(|| svg_attribute(svg, "viewbox"))?;
+    let values = view_box
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.len() < 4 {
+        return None;
+    }
+    let width = parse_svg_length(values[2])?;
+    let height = parse_svg_length(values[3])?;
+    Some((width, height))
+}
+
+fn svg_attribute<'a>(svg: &'a str, name: &str) -> Option<&'a str> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(start) = svg.find(&needle) {
+            let rest = &svg[start + needle.len()..];
+            if let Some(end) = rest.find(quote) {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    None
+}
+
+fn parse_svg_length(value: &str) -> Option<f32> {
+    let number = value
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+'))
+        .collect::<String>();
+    number
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     clipboard.get_text().ok().filter(|text| !text.is_empty())

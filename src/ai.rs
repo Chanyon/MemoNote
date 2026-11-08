@@ -148,6 +148,8 @@ pub struct AiPlanNode {
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default)]
+    pub svg: String,
+    #[serde(default)]
     pub image_prompt: String,
     #[serde(skip)]
     pub image_path: Option<String>,
@@ -211,7 +213,7 @@ Return ONLY one valid JSON object, with no markdown fences and no commentary, us
     {"id": "n1", "type": "text", "title": "section title", "content": "Markdown content for one focused card"},
     {"id": "m1", "type": "mind", "title": "root topic", "parent": null},
     {"id": "m2", "type": "mind", "title": "branch", "parent": "m1"},
-    {"id": "img1", "type": "image", "title": "short caption", "image_prompt": "clear visual description"}
+    {"id": "img1", "type": "image", "title": "short caption", "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 500\">...</svg>", "image_prompt": "optional raster fallback description"}
   ],
   "connections": [
     {"from": "n1", "to": "n2"}
@@ -220,7 +222,7 @@ Return ONLY one valid JSON object, with no markdown fences and no commentary, us
 Rules:
 - Split the document into 2 to 6 focused text cards. Each text card must be self-contained Markdown with a short heading.
 - Use a mind map when the topic has a natural hierarchy. Mind nodes use parent ids, with null for roots.
-- Include image nodes ONLY when a visual materially improves understanding, at most 2. The image_prompt must describe a clean labeled diagram or illustration and avoid dense text.
+- Include image nodes ONLY when a visual materially improves understanding, at most 2. Prefer a compact, valid, standalone SVG diagram in the svg field: include xmlns and viewBox (or width/height), use clear shapes, arrows, labels and a light background, and do not use scripts, foreignObject, external images, or web fonts. Only use image_prompt when a raster illustration is truly necessary.
 - Connections may reference any ids that exist. Connect related text cards or connect a text card to a mind root.
 - Keep titles short. Write the content in the same language as the user's request."#;
 
@@ -268,42 +270,70 @@ Rules:
         anyhow::bail!("AI did not return any usable whiteboard nodes");
     }
 
-    if include_images && !provider.image_model.trim().is_empty() {
-        let total = plan
-            .nodes
+    let raster_enabled = include_images && !provider.image_model.trim().is_empty();
+    let raster_total = if raster_enabled {
+        plan.nodes
             .iter()
-            .filter(|node| node.node_type == "image" && !node.image_prompt.trim().is_empty())
-            .count();
-        let mut index = 0usize;
-        for node in plan
-            .nodes
-            .iter_mut()
-            .filter(|node| node.node_type == "image")
-        {
-            if node.image_prompt.trim().is_empty() {
-                continue;
+            .filter(|node| {
+                node.node_type == "image"
+                    && clean_svg_code(&node.svg).is_none()
+                    && !node.image_prompt.trim().is_empty()
+            })
+            .count()
+    } else {
+        0
+    };
+    let mut raster_index = 0usize;
+    for node in plan
+        .nodes
+        .iter_mut()
+        .filter(|node| node.node_type == "image")
+    {
+        if let Some(svg) = clean_svg_code(&node.svg) {
+            match crate::model::save_generated_svg(assets_root, &svg) {
+                Ok((path, width, height)) => {
+                    node.image_path = Some(
+                        path.strip_prefix(assets_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                    node.image_width = width;
+                    node.image_height = height;
+                }
+                Err(_) => {
+                    plan.image_failures += 1;
+                }
             }
-            index += 1;
-            on_event(AiBoardStreamEvent::Stage(AiBoardStage::GeneratingImage {
-                index,
-                total,
-            }));
-            match generate_image(provider, &node.image_prompt) {
-                Ok(bytes) => match crate::model::save_generated_image(assets_root, &bytes) {
-                    Ok((path, width, height)) => {
-                        node.image_path = Some(
-                            path.strip_prefix(assets_root)
-                                .unwrap_or(&path)
-                                .to_string_lossy()
-                                .replace('\\', "/"),
-                        );
-                        node.image_width = width;
-                        node.image_height = height;
-                    }
-                    Err(_) => plan.image_failures += 1,
-                },
+            continue;
+        }
+        let invalid_svg = !node.svg.trim().is_empty();
+        if !raster_enabled || node.image_prompt.trim().is_empty() {
+            if invalid_svg {
+                plan.image_failures += 1;
+            }
+            continue;
+        }
+        raster_index += 1;
+        on_event(AiBoardStreamEvent::Stage(AiBoardStage::GeneratingImage {
+            index: raster_index,
+            total: raster_total,
+        }));
+        match generate_image(provider, &node.image_prompt) {
+            Ok(bytes) => match crate::model::save_generated_image(assets_root, &bytes) {
+                Ok((path, width, height)) => {
+                    node.image_path = Some(
+                        path.strip_prefix(assets_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                    node.image_width = width;
+                    node.image_height = height;
+                }
                 Err(_) => plan.image_failures += 1,
-            }
+            },
+            Err(_) => plan.image_failures += 1,
         }
     }
 
@@ -471,6 +501,41 @@ fn normalize_plan(plan: &mut AiBoardPlan) {
     plan.connections.retain(|connection| {
         !connection.from.trim().is_empty() && !connection.to.trim().is_empty()
     });
+}
+
+fn clean_svg_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = if let Some(rest) = trimmed.strip_prefix("```") {
+        let start = rest.find('\n').map(|index| index + 1).unwrap_or(0);
+        let end = rest.rfind("```").unwrap_or(rest.len());
+        rest.get(start..end).unwrap_or("")
+    } else {
+        trimmed
+    };
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("<svg")?;
+    let end = lower.rfind("</svg>").map(|index| index + 6)?;
+    let mut svg = body.get(start..end)?.trim().to_string();
+    let lower = svg.to_ascii_lowercase();
+    if [
+        "<script",
+        "<foreignobject",
+        "javascript:",
+        "onload=",
+        "onclick=",
+    ]
+    .iter()
+    .any(|blocked| lower.contains(blocked))
+    {
+        return None;
+    }
+    if !lower.contains("xmlns=") && svg.len() >= 4 {
+        svg.insert_str(4, " xmlns=\"http://www.w3.org/2000/svg\"");
+    }
+    Some(svg)
 }
 
 fn generate_image(provider: &AiSettings, prompt: &str) -> Result<Vec<u8>> {
@@ -743,6 +808,73 @@ mod tests {
         assert_eq!(plan.title, "Streamed plan");
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!(plan.connections.len(), 1);
+        server.join().expect("test server should finish");
+    }
+
+    #[test]
+    fn cleans_svg_fences_and_rejects_unsafe_markup() {
+        let svg = clean_svg_code("```svg\n<svg><rect width=\"10\" height=\"10\"/></svg>\n```")
+            .expect("fenced svg should be accepted");
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+        assert!(svg.contains("<rect"));
+        assert!(clean_svg_code("<svg><script>alert(1)</script></svg>").is_none());
+        assert!(clean_svg_code("<svg><foreignObject></foreignObject></svg>").is_none());
+        assert!(clean_svg_code("no svg here").is_none());
+    }
+
+    #[test]
+    fn generates_and_saves_svg_diagrams_without_an_image_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should arrive");
+            read_request(&mut stream);
+            let plan = serde_json::json!({
+                "title": "SVG plan",
+                "nodes": [
+                    {"id": "n1", "type": "text", "title": "Overview", "content": "# Overview"},
+                    {
+                        "id": "img1",
+                        "type": "image",
+                        "title": "Diagram",
+                        "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 500\"><rect width=\"800\" height=\"500\" fill=\"#eef2ff\"/><text x=\"40\" y=\"80\">Ownership</text></svg>"
+                    }
+                ],
+                "connections": [{"from": "n1", "to": "img1"}]
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": plan}}]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be written");
+        });
+
+        let assets_root =
+            std::env::temp_dir().join(format!("whiteboard-svg-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&assets_root).expect("temp assets folder");
+        let provider = test_provider(format!("http://{address}/v1"));
+        let plan = generate_board_plan(&provider, "Draw it", false, &assets_root)
+            .expect("SVG plan should be generated");
+        let image = plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == "image")
+            .expect("image node");
+        let path = image.image_path.as_ref().expect("saved svg path");
+        assert!(path.ends_with(".svg"));
+        assert!(assets_root.join(path).exists());
+        assert_eq!(image.image_width, 800.0);
+        assert_eq!(image.image_height, 500.0);
+        assert_eq!(plan.image_failures, 0);
+        std::fs::remove_dir_all(&assets_root).ok();
         server.join().expect("test server should finish");
     }
 

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui_kit::component::{Theme, ThemeMode, try_parse_color};
-use gpui_kit::{App, Hsla};
+use gpui_kit::{App, Hsla, SharedString};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +300,14 @@ fn option_matches(value: &Option<String>, expected: Option<&str>) -> bool {
     }
 }
 
+fn preferred_mono_font(cx: &App) -> Option<SharedString> {
+    let installed = cx.text_system().all_font_names();
+    ["Cascadia Mono", "Cascadia Code", "Courier New", "Consolas"]
+        .iter()
+        .find(|candidate| installed.iter().any(|name| name.as_str() == **candidate))
+        .map(|name| SharedString::from(*name))
+}
+
 pub fn apply_theme(settings: &ThemeSettings, cx: &mut App) {
     let mode = if settings.dark {
         ThemeMode::Dark
@@ -307,6 +315,12 @@ pub fn apply_theme(settings: &ThemeSettings, cx: &mut App) {
         ThemeMode::Light
     };
     Theme::change(mode, None, cx);
+
+    if let Some(family) = preferred_mono_font(cx) {
+        Theme::update(cx, |theme| {
+            theme.mono_font_family = family;
+        });
+    }
 
     let accent = settings
         .accent

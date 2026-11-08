@@ -5662,9 +5662,8 @@ impl WhiteboardApp {
                                 ),
                         )
                         .child(
-                            h_flex()
-                                .gap_3()
-                                .items_center()
+                            v_flex()
+                                .gap_2()
                                 .child(
                                     h_flex()
                                         .gap_2()
@@ -5702,12 +5701,15 @@ impl WhiteboardApp {
                                 )
                                 .child(
                                     div()
-                                        .flex_1()
+                                        .w_full()
+                                        .min_w_0()
                                         .text_xs()
                                         .text_color(muted)
+                                        .line_height(relative(1.45))
+                                        .whitespace_normal()
                                         .child(self.tr(
-                                            "配图需要设置中的图片模型支持",
-                                            "Images use the image model configured in Settings",
+                                            "AI 优先用 SVG 生成图表；SVG 无需图片模型，其他配图需要设置中的图片模型支持",
+                                            "AI prefers SVG diagrams, which need no image model; other images use the configured image model",
                                         )),
                                 ),
                         )
@@ -6916,6 +6918,15 @@ fn build_image_svg(
 ) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let encoded = BASE64.encode(bytes);
+    let mime = if path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".svg")
+    {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    };
     let width = width.max(80.0);
     let height = height.max(60.0);
     let bg = css_color(theme.popover);
@@ -6927,7 +6938,7 @@ fn build_image_svg(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width:.2}" height="{height:.2}" viewBox="0 0 {width:.2} {height:.2}">
   <g transform="translate({cx:.3} {cy:.3}) scale({scale:.4}) rotate({rotation:.3}) translate({neg_cx:.3} {neg_cy:.3})">
     <rect x="1" y="1" width="{rect_w:.2}" height="{rect_h:.2}" rx="8" fill="{bg}" stroke="{border}" stroke-width="2"/>
-    <image x="{padding:.2}" y="{padding:.2}" width="{image_w:.2}" height="{image_h:.2}" preserveAspectRatio="xMidYMid meet" href="data:image/png;base64,{encoded}"/>
+    <image x="{padding:.2}" y="{padding:.2}" width="{image_w:.2}" height="{image_h:.2}" preserveAspectRatio="xMidYMid meet" href="data:{mime};base64,{encoded}"/>
   </g>
 </svg>"#,
         width = width,
@@ -6945,6 +6956,7 @@ fn build_image_svg(
         image_h = height - padding * 2.0,
         bg = bg,
         border = border,
+        mime = mime,
         encoded = encoded,
     ))
 }
@@ -7455,6 +7467,36 @@ fn fit_image(width: f32, height: f32) -> (f32, f32) {
     ((width * scale).max(80.0), (height * scale).max(60.0))
 }
 
+fn is_tree_glyph(ch: char) -> bool {
+    matches!(
+        ch,
+        '├' | '└' | '│' | '─' | '┌' | '┐' | '┘' | '┬' | '┴' | '┼'
+    )
+}
+
+fn markdown_with_tree_breaks(content: &str) -> String {
+    if !content.chars().any(is_tree_glyph) {
+        return content.to_string();
+    }
+    let mut result = String::with_capacity(content.len() + content.lines().count() * 2);
+    let mut in_fence = false;
+    for (index, line) in content.split('\n').enumerate() {
+        if index > 0 {
+            result.push('\n');
+        }
+        let trimmed = line.trim_start();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if is_fence {
+            in_fence = !in_fence;
+        }
+        result.push_str(line);
+        if !in_fence && !is_fence && line.chars().any(is_tree_glyph) {
+            result.push_str("  ");
+        }
+    }
+    result
+}
+
 fn render_editor_preview_content(
     content: String,
     format: TextFormat,
@@ -7462,11 +7504,14 @@ fn render_editor_preview_content(
     line_height: Pixels,
 ) -> AnyElement {
     match format {
-        TextFormat::Markdown => TextView::markdown(SharedString::from("editor-preview"), content)
-            .selectable(false)
-            .w_full()
-            .min_w_0()
-            .into_any_element(),
+        TextFormat::Markdown => {
+            let content = markdown_with_tree_breaks(&content);
+            TextView::markdown(SharedString::from("editor-preview"), content)
+                .selectable(false)
+                .w_full()
+                .min_w_0()
+                .into_any_element()
+        }
         TextFormat::Plain => {
             let lines = if content.is_empty() {
                 vec![" ".to_string()]
@@ -7506,6 +7551,7 @@ fn render_text_content(
 ) -> AnyElement {
     match format {
         TextFormat::Markdown => {
+            let content = markdown_with_tree_breaks(&content);
             TextView::markdown(SharedString::from(format!("markdown-{node_id}")), content)
                 .selectable(false)
                 .w_full()
@@ -7949,6 +7995,17 @@ mod tests {
         let horizontal = horizontal.expect("horizontal scrollbar should be visible");
         assert!((vertical.thumb_offset - vertical.thumb_range).abs() < 0.001);
         assert!((horizontal.thumb_offset - horizontal.thumb_range).abs() < 0.001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_tree_lines_get_hard_breaks() {
+        let source = "├── src/\n│   └── main.rs\nplain text";
+        let rendered = markdown_with_tree_breaks(source);
+        let lines = rendered.split('\n').collect::<Vec<_>>();
+        assert!(lines[0].ends_with("  "));
+        assert!(lines[1].ends_with("  "));
+        assert_eq!(lines[2], "plain text");
+        assert!(!markdown_with_tree_breaks("```\n├── x\n```").contains("  \n"));
     }
 
     #[::core::prelude::v1::test]
